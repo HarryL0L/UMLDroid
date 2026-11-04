@@ -1,0 +1,55 @@
+From d8c0c7dd18b7209474bf5fcfd656903f7fc17dda Mon Sep 17 00:00:00 2001
+From: BullyMaguire-lol <temp9040@gmail.com>
+Date: Tue, 3 Nov 2026 18:08:22 +0530
+Subject: [PATCH 18/18] um: no stub thread for single-threaded processes
+
+With stub threads, every task got a host thread of its own in the stub
+process on its first way out to userspace, even when it was alone in
+its MM: fork (and the exit of the child) then started and stopped a
+stub thread. That made fork about three times slower.
+
+A task alone in its MM now runs in the stub process itself; it gets a
+stub thread once the MM has other users ("eagerstubthreads" restores
+the old behaviour).
+---
+ arch/um/kernel/skas/mmu.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/arch/um/kernel/skas/mmu.c b/arch/um/kernel/skas/mmu.c
+index bc55be19e..8a089e44f 100644
+--- a/arch/um/kernel/skas/mmu.c
++++ b/arch/um/kernel/skas/mmu.c
+@@ -136,6 +136,15 @@ static int __init nostubthreads_setup(char *str)
+ }
+ __setup("nostubthreads", nostubthreads_setup);
+ 
++static bool lazy_stub_threads = true;
++
++static int __init eagerstubthreads_setup(char *str)
++{
++	lazy_stub_threads = false;
++	return 1;
++}
++__setup("eagerstubthreads", eagerstubthreads_setup);
++
+ /**
+  * current_stub_prepare() - give the current task a stub thread of its own
+  *
+@@ -164,6 +173,14 @@ void current_stub_prepare(void)
+ 	if (READ_ONCE(ctx->stub_threads_exhausted) || ctx->id.pid <= 0)
+ 		return;
+ 
++	/*
++	 * A single-threaded process has the stub process to itself: starting
++	 * (and stopping) a stub thread would only make fork, exec and exit
++	 * slower. It gets one once it has company, on its next way out.
++	 */
++	if (lazy_stub_threads && atomic_read(&mm->mm_users) <= 1)
++		return;
++
+ 	t = kzalloc(sizeof(*t), GFP_KERNEL);
+ 	stack = __get_free_pages(GFP_KERNEL | __GFP_ZERO,
+ 				 ilog2(STUB_DATA_PAGES));
+-- 
+2.56.0
+

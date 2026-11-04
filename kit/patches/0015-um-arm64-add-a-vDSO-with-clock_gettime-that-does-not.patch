@@ -1,0 +1,659 @@
+From 3f9b2f9347c11f78709967ad4c4818b9fe723c4c Mon Sep 17 00:00:00 2001
+From: BullyMaguire-lol <temp9040@gmail.com>
+Date: Tue, 3 Nov 2026 12:52:07 +0530
+Subject: [PATCH 15/18] um: arm64: add a vDSO with clock_gettime() that does
+ not trap
+
+Every clock_gettime() and gettimeofday() of Android trapped into UML
+(about 3 us on a phone). Map a real vDSO (AT_SYSINFO_EHDR) and a read-only
+vvar page into every process instead:
+
+- The vvar page holds the guest timekeeper's parameters (cycle_last,
+  mult, shift, base, xtime_nsec of tkr_mono and tkr_raw, and the
+  real/boot/tai offsets), updated from the pvclock_gtod notifier on every
+  timekeeping update under a sequence count.
+- The vDSO reads the host CLOCK_MONOTONIC through
+  stub_vdso_clock_gettime() in the stub code page; the stub's seccomp
+  filter now allows clock_gettime from there. It converts the host
+  nanoseconds into "timer" clocksource cycles and applies exactly the
+  timekeeper's formula, so results match the clock_gettime syscall (no
+  steps backwards between the two).
+- Other clocks, time travel mode, another clocksource and "novdsoclock"
+  fall back to the system call. __kernel_rt_sigreturn moves from the
+  signal trampoline page into the vDSO.
+
+clock_gettime: 3.0 us -> 0.34 us.
+---
+ arch/arm64/um/Makefile             |   3 +-
+ arch/arm64/um/asm/elf.h            |   6 +-
+ arch/arm64/um/shared/sysdep/vvar.h |  31 ++++++
+ arch/arm64/um/signal.c             |   4 +-
+ arch/arm64/um/stub_vdso.S          |  15 +++
+ arch/arm64/um/vdso.c               | 153 +++++++++++++++++++++++------
+ arch/arm64/um/vdso/Makefile        |  37 +++++++
+ arch/arm64/um/vdso/vdso-image.S    |  11 +++
+ arch/arm64/um/vdso/vdso.c          | 144 +++++++++++++++++++++++++++
+ arch/arm64/um/vdso/vdso.lds.S      |  48 +++++++++
+ arch/um/kernel/skas/stub_exe.c     |  18 ++--
+ 11 files changed, 428 insertions(+), 42 deletions(-)
+ create mode 100644 arch/arm64/um/shared/sysdep/vvar.h
+ create mode 100644 arch/arm64/um/stub_vdso.S
+ create mode 100644 arch/arm64/um/vdso/Makefile
+ create mode 100644 arch/arm64/um/vdso/vdso-image.S
+ create mode 100644 arch/arm64/um/vdso/vdso.c
+ create mode 100644 arch/arm64/um/vdso/vdso.lds.S
+
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index 39206569b..d66024eab 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -4,7 +4,8 @@
+ #
+ 
+ obj-y = bugs.o delay.o fault.o ptrace.o setjmp.o signal.o stub_segv.o \
+-	sys_call_table.o syscalls.o sysrq.o tls.o vdso.o os-Linux/
++	sys_call_table.o syscalls.o sysrq.o tls.o vdso.o stub_vdso.o os-Linux/ \
++	vdso/
+ 
+ USER_OBJS := bugs.o fault.o
+ 
+diff --git a/arch/arm64/um/asm/elf.h b/arch/arm64/um/asm/elf.h
+index e72ec6ada..aa0f61922 100644
+--- a/arch/arm64/um/asm/elf.h
++++ b/arch/arm64/um/asm/elf.h
+@@ -46,7 +46,9 @@ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 	int uses_interp);
+ 
+-/* Address of the signal return trampoline page, see vdso.c */
+-extern unsigned long um_vdso_addr;
++/* Addresses of the vDSO and its signal return trampoline, see vdso.c */
++extern unsigned long um_vdso_addr, um_sigtramp_addr;
++
++#define ARCH_DLINFO	NEW_AUX_ENT(AT_SYSINFO_EHDR, um_vdso_addr)
+ 
+ #endif
+diff --git a/arch/arm64/um/shared/sysdep/vvar.h b/arch/arm64/um/shared/sysdep/vvar.h
+new file mode 100644
+index 000000000..d014796f9
+--- /dev/null
++++ b/arch/arm64/um/shared/sysdep/vvar.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Time data shared between the UML kernel and the arm64 UML vDSO. The vDSO
++ * reads the host's CLOCK_MONOTONIC through a function in the stub page (the
++ * host's seccomp filter only allows that syscall from there) and turns it
++ * into guest time exactly as the guest timekeeper does: host nanoseconds are
++ * the "timer" clocksource's cycles times 2^cycle_shift.
++ */
++#ifndef __UM_ARM64_VVAR_H
++#define __UM_ARM64_VVAR_H
++
++struct um_vvar_clock {
++	unsigned long long cycle_last;
++	unsigned long long mask;
++	unsigned int mult;
++	unsigned int shift;
++	long long base;			/* ns */
++	unsigned long long xtime_nsec;	/* ns << shift */
++};
++
++struct um_vvar {
++	unsigned int seq;		/* odd while being updated */
++	unsigned int enabled;		/* 0: use the syscall */
++	unsigned long long host_clock;	/* int (*)(clockid_t, struct timespec *) */
++	unsigned int cycle_shift;
++	unsigned int pad;
++	struct um_vvar_clock mono, raw;
++	long long offs_real, offs_boot, offs_tai;
++};
++
++#endif
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index b9cdd7f65..4c14f2d07 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -17,7 +17,7 @@
+ #include <registers.h>
+ #include <skas.h>
+ 
+-extern unsigned long um_vdso_addr;
++extern unsigned long um_sigtramp_addr;
+ 
+ /* PSTATE bits userspace may change: the NZCV flags */
+ #define UM_PSTATE_USER_MASK	0xf0000000UL
+@@ -138,7 +138,7 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
+ 	if (ksig->ka.sa.sa_flags & SA_RESTORER)
+ 		sigtramp = (unsigned long)ksig->ka.sa.sa_restorer;
+ 	else
+-		sigtramp = um_vdso_addr;
++		sigtramp = um_sigtramp_addr;
+ 
+ 	PT_REGS_X(regs, 0) = ksig->sig;
+ 	PT_REGS_X(regs, 1) = (unsigned long)&frame->info;
+diff --git a/arch/arm64/um/stub_vdso.S b/arch/arm64/um/stub_vdso.S
+new file mode 100644
+index 000000000..824d2c3b6
+--- /dev/null
++++ b/arch/arm64/um/stub_vdso.S
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Read a host clock for the vDSO (see vdso.c): this runs in the stub code
++ * page, from which the stub's seccomp filter allows host clock_gettime().
++ * int stub_vdso_clock_gettime(clockid_t clock, struct timespec *ts)
++ */
++#include <linux/linkage.h>
++#include <asm/unistd.h>
++
++	.section .__syscall_stub, "ax"
++SYM_FUNC_START(stub_vdso_clock_gettime)
++	mov	x8, #__NR_clock_gettime
++	svc	#0
++	ret
++SYM_FUNC_END(stub_vdso_clock_gettime)
+diff --git a/arch/arm64/um/vdso.c b/arch/arm64/um/vdso.c
+index 93b00bbb1..a79d311f8 100644
+--- a/arch/arm64/um/vdso.c
++++ b/arch/arm64/um/vdso.c
+@@ -1,69 +1,164 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * The signal return trampoline page for UML on arm64.
++ * The vDSO of UML on arm64 (see vdso/vdso.c) and the vvar page holding the
++ * guest timekeeper's parameters for it.
+  *
+- * Native arm64 returns from signal handlers through __kernel_rt_sigreturn in
+- * the vDSO unless SA_RESTORER is given. UML maps a single page containing an
+- * equivalent trampoline into every process instead of a full vDSO (vDSO time
+- * functions would have to be syscalls anyway).
++ * Both are mapped at the top of every process: the vvar page (read only) at
++ * task_size - 2 pages, the vDSO at task_size - 1 page. The vDSO reads the
++ * host clock through stub_vdso_clock_gettime() in the stub code page, the
++ * only place from which the stub process' seccomp filter lets userspace run
++ * a host system call, and converts it into guest time.
+  */
+ 
++#include <linux/elf.h>
+ #include <linux/init.h>
+ #include <linux/mm.h>
++#include <linux/notifier.h>
++#include <linux/pvclock_gtod.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/timekeeper_internal.h>
++#include <linux/time-internal.h>
+ #include <asm/elf.h>
+ #include <asm/page.h>
+ #include <asm/unistd.h>
++#include <as-layout.h>
++#include <sysdep/vvar.h>
+ 
+ unsigned long um_vdso_addr;
+-static struct page *um_sigpage;
++unsigned long um_sigtramp_addr;
++static struct page *um_vdso_page, *um_vvar_page;
++static struct um_vvar *um_vvar;
++static bool vdso_clock_disabled;
+ 
+ extern unsigned long task_size;
++extern char um_vdso_start[], um_vdso_end[];
++extern char __syscall_stub_start[];
++extern void stub_vdso_clock_gettime(void);
+ 
+-#define A64_MOVZ_X8(imm)	(0xd2800008u | ((u32)(imm) << 5))
+-#define A64_SVC_0		0xd4000001u
+-#define A64_BRK_0		0xd4200000u
++static int __init novdsoclock_setup(char *str)
++{
++	vdso_clock_disabled = true;
++	return 1;
++}
++__setup("novdsoclock", novdsoclock_setup);
+ 
+-static int __init init_sigpage(void)
++/* Find a dynamic symbol of the vDSO image, as an offset into it */
++static unsigned long __init vdso_symbol(const char *name)
+ {
+-	u32 *code;
+-	int i;
++	Elf64_Ehdr *eh = (void *)um_vdso_start;
++	Elf64_Shdr *sh = (void *)um_vdso_start + eh->e_shoff;
++	int i, j;
++
++	for (i = 0; i < eh->e_shnum; i++) {
++		Elf64_Sym *sym = (void *)um_vdso_start + sh[i].sh_offset;
++		const char *str;
++
++		if (sh[i].sh_type != SHT_DYNSYM)
++			continue;
++		str = (void *)um_vdso_start + sh[sh[i].sh_link].sh_offset;
++		for (j = 0; j < sh[i].sh_size / sizeof(*sym); j++)
++			if (!strcmp(str + sym[j].st_name, name))
++				return sym[j].st_value;
++	}
++	panic("vDSO symbol %s not found\n", name);
++}
++
++static int __init init_vdso(void)
++{
++	BUG_ON(um_vdso_end - um_vdso_start > PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct um_vvar) > PAGE_SIZE);
+ 
+ 	um_vdso_addr = task_size - PAGE_SIZE;
+ 
+-	um_sigpage = alloc_page(GFP_KERNEL);
+-	if (!um_sigpage)
+-		panic("Cannot allocate sigpage\n");
++	um_vdso_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	um_vvar_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	if (!um_vdso_page || !um_vvar_page)
++		panic("Cannot allocate vdso\n");
+ 
+-	code = page_address(um_sigpage);
+-	for (i = 0; i < PAGE_SIZE / sizeof(*code); i++)
+-		code[i] = A64_BRK_0;
++	memcpy(page_address(um_vdso_page), um_vdso_start,
++	       um_vdso_end - um_vdso_start);
++	um_sigtramp_addr = um_vdso_addr + vdso_symbol("__kernel_rt_sigreturn");
+ 
+-	/* __kernel_rt_sigreturn: mov x8, #__NR_rt_sigreturn; svc #0 */
+-	code[0] = A64_MOVZ_X8(__NR_rt_sigreturn);
+-	code[1] = A64_SVC_0;
++	um_vvar = page_address(um_vvar_page);
++	um_vvar->host_clock = STUB_CODE +
++		((unsigned long)stub_vdso_clock_gettime -
++		 (unsigned long)__syscall_stub_start);
++	um_vvar->cycle_shift = ilog2(TIMER_MULTIPLIER);
+ 
+ 	return 0;
+ }
+-subsys_initcall(init_sigpage);
++subsys_initcall(init_vdso);
++
++static void vvar_clock(struct um_vvar_clock *c, struct tk_read_base *tkr)
++{
++	c->cycle_last = tkr->cycle_last;
++	c->mask = tkr->mask;
++	c->mult = tkr->mult;
++	c->shift = tkr->shift;
++	c->base = ktime_to_ns(tkr->base);
++	c->xtime_nsec = tkr->xtime_nsec;
++}
++
++/* Called with the timekeeper locked whenever it changes (every tick) */
++static int vvar_update(struct notifier_block *nb, unsigned long was_set,
++		       void *priv)
++{
++	struct timekeeper *tk = priv;
++	struct um_vvar *v = um_vvar;
++
++	WRITE_ONCE(v->seq, v->seq + 1);
++	smp_wmb();
++
++	/* Only the host clock based clocksource can be read by the vDSO */
++	v->enabled = !vdso_clock_disabled && time_travel_mode == TT_MODE_OFF &&
++		     !strcmp(tk->tkr_mono.clock->name, "timer");
++	vvar_clock(&v->mono, &tk->tkr_mono);
++	vvar_clock(&v->raw, &tk->tkr_raw);
++	v->offs_real = ktime_to_ns(tk->offs_real);
++	v->offs_boot = ktime_to_ns(tk->offs_boot);
++	v->offs_tai = ktime_to_ns(tk->offs_tai);
++
++	smp_wmb();
++	WRITE_ONCE(v->seq, v->seq + 1);
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block vvar_notifier = {
++	.notifier_call = vvar_update,
++};
++
++static int __init init_vvar(void)
++{
++	return pvclock_gtod_register_notifier(&vvar_notifier);
++}
++device_initcall(init_vvar);
+ 
+ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ {
+ 	struct vm_area_struct *vma;
+ 	struct mm_struct *mm = current->mm;
+-	static struct vm_special_mapping sigpage_mapping = {
+-		.name = "[sigpage]",
+-		.pages = &um_sigpage,
++	static struct vm_special_mapping vvar_mapping = {
++		.name = "[vvar]",
++		.pages = &um_vvar_page,
++	};
++	static struct vm_special_mapping vdso_mapping = {
++		.name = "[vdso]",
++		.pages = &um_vdso_page,
+ 	};
+ 
+ 	if (mmap_write_lock_killable(mm))
+ 		return -EINTR;
+ 
+-	vma = _install_special_mapping(mm, um_vdso_addr, PAGE_SIZE,
+-		VM_READ|VM_EXEC|
+-		VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+-		&sigpage_mapping);
++	vma = _install_special_mapping(mm, um_vdso_addr - PAGE_SIZE, PAGE_SIZE,
++		VM_READ | VM_MAYREAD, &vvar_mapping);
++	if (!IS_ERR(vma))
++		vma = _install_special_mapping(mm, um_vdso_addr, PAGE_SIZE,
++			VM_READ | VM_EXEC |
++			VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
++			&vdso_mapping);
+ 
+ 	mmap_write_unlock(mm);
+ 
+diff --git a/arch/arm64/um/vdso/Makefile b/arch/arm64/um/vdso/Makefile
+new file mode 100644
+index 000000000..6f7fe97a2
+--- /dev/null
++++ b/arch/arm64/um/vdso/Makefile
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# The arm64 UML vDSO, see vdso.c.
++#
++
++obj-y += vdso-image.o
++
++targets += vdso.so vdso.so.dbg vdso.lds vdso.o
++
++CPPFLAGS_vdso.lds += -P -C -U$(ARCH)
++
++$(obj)/vdso-image.o: $(obj)/vdso.so
++
++$(obj)/vdso.so.dbg: $(obj)/vdso.lds $(obj)/vdso.o FORCE
++	$(call if_changed,vdso)
++
++$(obj)/%.so: OBJCOPYFLAGS := -S
++$(obj)/%.so: $(obj)/%.so.dbg FORCE
++	$(call if_changed,objcopy)
++
++# Userspace code: position independent, no instrumentation, no FP/SIMD
++CFLAGS_vdso.o := -fPIC -O2 -ffreestanding -fno-stack-protector \
++	-fno-asynchronous-unwind-tables -fno-unwind-tables \
++	-mgeneral-regs-only -I$(srctree)/arch/arm64/um/shared
++CFLAGS_REMOVE_vdso.o = -pg -fprofile-arcs -ftest-coverage $(CC_FLAGS_LTO) \
++	$(CC_FLAGS_CFI) -mcmodel=large -fno-PIE -fno-pic -fno-PIC
++KCOV_INSTRUMENT := n
++GCOV_PROFILE := n
++UBSAN_SANITIZE := n
++KASAN_SANITIZE := n
++
++quiet_cmd_vdso = VDSO    $@
++      cmd_vdso = $(CC) -nostdlib -shared -fPIC -o $@ \
++		       -Wl,-T,$(filter %.lds,$^) $(filter %.o,$^) \
++		       -Wl,-soname=linux-vdso.so.1 -Wl,--hash-style=sysv \
++		       -Wl,-z,max-page-size=4096 -Wl,-z,noexecstack \
++		       -Wl,--no-undefined -Wl,-Bsymbolic -Wl,--build-id=none
+diff --git a/arch/arm64/um/vdso/vdso-image.S b/arch/arm64/um/vdso/vdso-image.S
+new file mode 100644
+index 000000000..1bc6e4ebe
+--- /dev/null
++++ b/arch/arm64/um/vdso/vdso-image.S
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <linux/init.h>
++#include <linux/linkage.h>
++
++__INITDATA
++
++SYM_DATA_START(um_vdso_start)
++	.incbin "arch/arm64/um/vdso/vdso.so"
++SYM_DATA_END_LABEL(um_vdso_start, SYM_L_GLOBAL, um_vdso_end)
++
++__FINIT
+diff --git a/arch/arm64/um/vdso/vdso.c b/arch/arm64/um/vdso/vdso.c
+new file mode 100644
+index 000000000..fb67232ef
+--- /dev/null
++++ b/arch/arm64/um/vdso/vdso.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * The vDSO of UML on arm64: clock_gettime() and gettimeofday() without
++ * trapping into UML. The host clock is read through the stub page and
++ * converted with the guest timekeeper's parameters from the vvar page (see
++ * sysdep/vvar.h). Everything else, and any clock not handled here, is a
++ * normal system call.
++ */
++#include <sysdep/vvar.h>
++
++#define CLOCK_REALTIME		0
++#define CLOCK_MONOTONIC		1
++#define CLOCK_MONOTONIC_RAW	4
++#define CLOCK_REALTIME_COARSE	5
++#define CLOCK_MONOTONIC_COARSE	6
++#define CLOCK_BOOTTIME		7
++#define CLOCK_TAI		11
++
++#define NR_gettimeofday		169
++#define NR_clock_gettime	113
++#define NR_clock_getres		114
++
++struct vdso_timespec { long tv_sec; long tv_nsec; };
++struct vdso_timeval { long tv_sec; long tv_usec; };
++
++/* The page before the vDSO, see vdso.lds.S */
++extern const struct um_vvar um_vvar __attribute__((visibility("hidden")));
++
++static inline long syscall2(long nr, long a, long b)
++{
++	register long x8 asm("x8") = nr;
++	register long x0 asm("x0") = a;
++	register long x1 asm("x1") = b;
++
++	asm volatile("svc #0" : "+r" (x0) : "r" (x8), "r" (x1) : "memory");
++	return x0;
++}
++
++static inline unsigned long long tk_ns(const struct um_vvar_clock *c,
++				       unsigned long long cycles, int coarse)
++{
++	unsigned long long d = coarse ? 0 : (cycles - c->cycle_last) & c->mask;
++
++	return c->base + ((d * c->mult + c->xtime_nsec) >> c->shift);
++}
++
++/* Guest time of @clk in ns, or -1 to use the system call */
++static long long guest_ns(int clk)
++{
++	const volatile struct um_vvar *v = &um_vvar;
++	struct vdso_timespec ts;
++	unsigned long long cycles, ns;
++	unsigned int seq;
++	int coarse = clk == CLOCK_REALTIME_COARSE || clk == CLOCK_MONOTONIC_COARSE;
++	long long off;
++
++	do {
++		seq = v->seq;
++		asm volatile("dmb ishld" ::: "memory");
++		if ((seq & 1) || !v->enabled)
++			return -1;
++		if (coarse) {
++			cycles = 0;
++		} else {
++			if (((int (*)(int, struct vdso_timespec *))v->host_clock)(CLOCK_MONOTONIC, &ts))
++				return -1;
++			cycles = ((unsigned long long)ts.tv_sec * 1000000000ULL +
++				  ts.tv_nsec) >> v->cycle_shift;
++		}
++		switch (clk) {
++		case CLOCK_MONOTONIC_RAW:
++			ns = tk_ns((const struct um_vvar_clock *)&v->raw, cycles, 0);
++			off = 0;
++			break;
++		case CLOCK_REALTIME:
++		case CLOCK_REALTIME_COARSE:
++			ns = tk_ns((const struct um_vvar_clock *)&v->mono, cycles, coarse);
++			off = v->offs_real;
++			break;
++		case CLOCK_BOOTTIME:
++			ns = tk_ns((const struct um_vvar_clock *)&v->mono, cycles, 0);
++			off = v->offs_boot;
++			break;
++		case CLOCK_TAI:
++			ns = tk_ns((const struct um_vvar_clock *)&v->mono, cycles, 0);
++			off = v->offs_tai;
++			break;
++		default:
++			ns = tk_ns((const struct um_vvar_clock *)&v->mono, cycles, coarse);
++			off = 0;
++			break;
++		}
++		asm volatile("dmb ishld" ::: "memory");
++	} while (v->seq != seq);
++
++	return ns + off;
++}
++
++static int handled(int clk)
++{
++	return clk == CLOCK_REALTIME || clk == CLOCK_MONOTONIC ||
++	       clk == CLOCK_MONOTONIC_RAW || clk == CLOCK_REALTIME_COARSE ||
++	       clk == CLOCK_MONOTONIC_COARSE || clk == CLOCK_BOOTTIME ||
++	       clk == CLOCK_TAI;
++}
++
++int __kernel_clock_gettime(int clk, struct vdso_timespec *ts)
++{
++	long long ns = handled(clk) ? guest_ns(clk) : -1;
++
++	if (ns < 0)
++		return syscall2(NR_clock_gettime, clk, (long)ts);
++	ts->tv_sec = ns / 1000000000LL;
++	ts->tv_nsec = ns % 1000000000LL;
++	return 0;
++}
++
++int __kernel_gettimeofday(struct vdso_timeval *tv, void *tz)
++{
++	long long ns;
++
++	if (tz || !tv)
++		return syscall2(NR_gettimeofday, (long)tv, (long)tz);
++	ns = guest_ns(CLOCK_REALTIME);
++	if (ns < 0)
++		return syscall2(NR_gettimeofday, (long)tv, (long)tz);
++	tv->tv_sec = ns / 1000000000LL;
++	tv->tv_usec = ns % 1000000000LL / 1000;
++	return 0;
++}
++
++int __kernel_clock_getres(int clk, struct vdso_timespec *res)
++{
++	return syscall2(NR_clock_getres, clk, (long)res);
++}
++
++/* Signal return trampoline (the kernel points the handler's LR here) */
++asm(".text\n"
++    ".globl __kernel_rt_sigreturn\n"
++    ".type __kernel_rt_sigreturn, %function\n"
++    "__kernel_rt_sigreturn:\n"
++    "	mov x8, #139\n"
++    "	svc #0\n"
++    ".size __kernel_rt_sigreturn, . - __kernel_rt_sigreturn\n");
+diff --git a/arch/arm64/um/vdso/vdso.lds.S b/arch/arm64/um/vdso/vdso.lds.S
+new file mode 100644
+index 000000000..cb431498d
+--- /dev/null
++++ b/arch/arm64/um/vdso/vdso.lds.S
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Linker script for the arm64 UML vDSO: one page, preceded by the vvar page.
++ */
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-bigaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++
++SECTIONS
++{
++	PROVIDE(um_vvar = . - 4096);
++	. = SIZEOF_HEADERS;
++
++	.hash		: { *(.hash) }			:text
++	.gnu.hash	: { *(.gnu.hash) }
++	.dynsym		: { *(.dynsym) }
++	.dynstr		: { *(.dynstr) }
++	.gnu.version	: { *(.gnu.version) }
++	.gnu.version_d	: { *(.gnu.version_d) }
++	.gnu.version_r	: { *(.gnu.version_r) }
++
++	.dynamic	: { *(.dynamic) }		:text	:dynamic
++
++	.rodata		: { *(.rodata*) *(.got) *(.got.plt) }	:text
++
++	.text		: { *(.text*) }			:text
++
++	/DISCARD/	: {
++		*(.data .data.* .bss .bss.* .note.* .comment .eh_frame*)
++	}
++}
++
++PHDRS
++{
++	text		PT_LOAD		FLAGS(5) FILEHDR PHDRS;	/* PF_R|PF_X */
++	dynamic		PT_DYNAMIC	FLAGS(4);		/* PF_R */
++}
++
++VERSION
++{
++	LINUX_2.6.39 {
++	global:
++		__kernel_rt_sigreturn;
++		__kernel_gettimeofday;
++		__kernel_clock_gettime;
++		__kernel_clock_getres;
++	local: *;
++	};
++}
+diff --git a/arch/um/kernel/skas/stub_exe.c b/arch/um/kernel/skas/stub_exe.c
+index af058ba08..78bea866d 100644
+--- a/arch/um/kernel/skas/stub_exe.c
++++ b/arch/um/kernel/skas/stub_exe.c
+@@ -12,9 +12,9 @@
+ void _start(void);
+ 
+ #ifdef UM_STUB_THREADS
+-#define STUB_NUM_ALLOWED 13
++#define STUB_NUM_ALLOWED 14
+ #else
+-#define STUB_NUM_ALLOWED 7
++#define STUB_NUM_ALLOWED 8
+ #endif
+ /* Allow syscall nr, the idx'th entry of STUB_NUM_ALLOWED in the filter */
+ #define STUB_ALLOW(nr, idx) \
+@@ -199,14 +199,16 @@ noinline static void __used real_init(void)
+ 			STUB_ALLOW(__NR_rt_sigreturn, 5),
+ #endif
+ 			STUB_ALLOW(__NR_rt_sigreturn, 6),
++			/* The host clock, for the vDSO (harmless elsewhere) */
++			STUB_ALLOW(__NR_clock_gettime, 7),
+ #ifdef UM_STUB_THREADS
+ 			/* Starting and stopping stub threads */
+-			STUB_ALLOW(__NR_clone, 7),
+-			STUB_ALLOW(__NR_sigaltstack, 8),
+-			STUB_ALLOW(__NR_rt_sigprocmask, 9),
+-			STUB_ALLOW(__NR_gettid, 10),
+-			STUB_ALLOW(__NR_tgkill, 11),
+-			STUB_ALLOW(__NR_exit, 12),
++			STUB_ALLOW(__NR_clone, 8),
++			STUB_ALLOW(__NR_sigaltstack, 9),
++			STUB_ALLOW(__NR_rt_sigprocmask, 10),
++			STUB_ALLOW(__NR_gettid, 11),
++			STUB_ALLOW(__NR_tgkill, 12),
++			STUB_ALLOW(__NR_exit, 13),
+ #endif
+ 
+ 			/* Not one of the permitted syscalls */
+-- 
+2.56.0
+

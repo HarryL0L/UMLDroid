@@ -1,0 +1,220 @@
+From b9318ddc8a603dc9c9d9c9d1cd6eb922fccc76e5 Mon Sep 17 00:00:00 2001
+From: BullyMaguire-lol <temp9040@gmail.com>
+Date: Tue, 3 Nov 2026 18:08:21 +0530
+Subject: [PATCH 17/18] um: keep a pool of started stub processes, reap dead
+ ones asynchronously
+
+Starting a stub process (clone, marking the kernel's FDs close-on-exec,
+exec of the stub binary, seccomp setup) costs milliseconds on a phone,
+and every fork and exec needs one. Keep stubpool=<n> (default 4)
+started stub processes ready: init_new_context() takes one and a
+worker starts a replacement in the background.
+
+destroy_context() also no longer waits for the host to tear the killed
+stub down; nothing runs in it any more and SIGCHLD reaps it.
+---
+ arch/um/include/shared/os.h |   1 +
+ arch/um/kernel/skas/mmu.c   | 123 +++++++++++++++++++++++++++++++++++-
+ arch/um/os-Linux/process.c  |   6 ++
+ 3 files changed, 127 insertions(+), 3 deletions(-)
+
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 7ea5a6a3c..aeb069413 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -198,6 +198,7 @@ extern int create_mem_file(unsigned long long len);
+ extern void report_enomem(void);
+ 
+ /* process.c */
++int os_check_alive(int pid);
+ pid_t os_reap_child(void);
+ extern void os_alarm_stub(int tgid, int tid);
+ extern void os_alarm_process(int pid);
+diff --git a/arch/um/kernel/skas/mmu.c b/arch/um/kernel/skas/mmu.c
+index a182a1162..bc55be19e 100644
+--- a/arch/um/kernel/skas/mmu.c
++++ b/arch/um/kernel/skas/mmu.c
+@@ -8,6 +8,7 @@
+ #include <linux/mm.h>
+ #include <linux/sched/signal.h>
+ #include <linux/slab.h>
++#include <linux/workqueue.h>
+ 
+ #include <shared/irq_kern.h>
+ #include <asm/pgalloc.h>
+@@ -259,6 +260,100 @@ void deactivate_mm(struct task_struct *tsk, struct mm_struct *mm)
+ 	free_stub_thread(t);
+ }
+ 
++/*
++ * Starting a stub process (clone, closing the kernel's FDs, exec of the stub
++ * binary, seccomp setup) takes milliseconds on a phone, and every fork and
++ * exec of userspace needs one. Keep a few started ones ready: fork/exec take
++ * one from the pool and a worker starts a replacement in the background.
++ */
++struct stub_pool_entry {
++	unsigned long stack;
++	int pid;
++	int sock;
++};
++
++static unsigned int stub_pool_size = 4;
++static struct stub_pool_entry stub_pool[16];
++static unsigned int stub_pool_count;
++static DEFINE_SPINLOCK(stub_pool_lock);
++
++static int __init stub_pool_setup(char *str)
++{
++	if (kstrtouint(str, 0, &stub_pool_size))
++		return 0;
++	stub_pool_size = min_t(unsigned int, stub_pool_size,
++			       ARRAY_SIZE(stub_pool));
++	return 1;
++}
++__setup("stubpool=", stub_pool_setup);
++
++static void stub_pool_refill(struct work_struct *work)
++{
++	bool stored;
++
++	for (;;) {
++		struct stub_pool_entry e;
++		struct mm_id id = {};
++
++		scoped_guard(spinlock, &stub_pool_lock)
++			if (stub_pool_count >= stub_pool_size)
++				return;
++
++		id.stack = __get_free_pages(GFP_KERNEL | __GFP_ZERO,
++					    ilog2(STUB_DATA_PAGES));
++		if (!id.stack)
++			return;
++		if (start_userspace(&id) < 0) {
++			free_pages(id.stack, ilog2(STUB_DATA_PAGES));
++			return;
++		}
++		e.stack = id.stack;
++		e.pid = id.pid;
++		e.sock = id.sock;
++
++		/* (scoped_guard() is a loop: no continue inside) */
++		stored = false;
++		scoped_guard(spinlock, &stub_pool_lock) {
++			if (stub_pool_count < stub_pool_size) {
++				stub_pool[stub_pool_count++] = e;
++				stored = true;
++			}
++		}
++		if (stored)
++			continue;
++
++		/* Filled up meanwhile: not needed after all */
++		os_kill_ptraced_process(e.pid, 1);
++		if (using_seccomp)
++			os_close_file(e.sock);
++		free_pages(e.stack, ilog2(STUB_DATA_PAGES));
++		return;
++	}
++}
++static DECLARE_WORK(stub_pool_work, stub_pool_refill);
++
++/* Take a started stub process for @id (stack, pid, sock), false if none */
++static bool stub_pool_take(struct mm_id *id)
++{
++	struct stub_pool_entry e = {};
++
++	if (!stub_pool_size)
++		return false;
++
++	scoped_guard(spinlock, &stub_pool_lock)
++		if (stub_pool_count)
++			e = stub_pool[--stub_pool_count];
++
++	schedule_work(&stub_pool_work);
++	if (!e.stack)
++		return false;
++
++	id->stack = e.stack;
++	id->pid = e.pid;
++	id->sock = e.sock;
++	return true;
++}
++
+ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ {
+ 	struct mm_id *new_id = &mm->context.id;
+@@ -277,13 +372,30 @@ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ 		goto out;
+ 	set_bit(0, mm->context.stub_slots);
+ 
++	new_id->syscall_data_len = 0;
++	new_id->syscall_fd_num = 0;
++
++	if (stub_pool_take(new_id)) {
++		stack = new_id->stack;
++		scoped_guard(spinlock_irqsave, &mm_list_lock)
++			list_add(&mm->context.list, &mm_list);
++		/* Died while waiting in the pool (nothing noticed it) */
++		if (os_check_alive(new_id->pid)) {
++			ret = 0;
++			goto started;
++		}
++		scoped_guard(spinlock_irqsave, &mm_list_lock)
++			list_del(&mm->context.list);
++		if (using_seccomp)
++			os_close_file(new_id->sock);
++		free_pages(stack, ilog2(STUB_DATA_PAGES));
++	}
++
+ 	stack = __get_free_pages(GFP_KERNEL | __GFP_ZERO, ilog2(STUB_DATA_PAGES));
+ 	if (stack == 0)
+ 		goto out_slots;
+ 
+ 	new_id->stack = stack;
+-	new_id->syscall_data_len = 0;
+-	new_id->syscall_fd_num = 0;
+ 
+ 	scoped_guard(spinlock_irqsave, &mm_list_lock) {
+ 		/* Insert into list, used for lookups when the child dies */
+@@ -293,6 +405,7 @@ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ 	ret = start_userspace(new_id);
+ 	if (ret < 0)
+ 		goto out_free;
++started:
+ 	new_id->tgid = new_id->pid;
+ 	new_id->proc_stack = new_id->stack;
+ 
+@@ -330,8 +443,12 @@ void destroy_context(struct mm_struct *mm)
+ 	scoped_guard(spinlock_irqsave, &mm_list_lock)
+ 		list_del(&mm->context.list);
+ 
++	/*
++	 * No task uses the stub any more, it waits in the host kernel. Do not
++	 * wait for the host to tear it down: SIGCHLD reaps it later.
++	 */
+ 	if (mmu->id.pid > 0) {
+-		os_kill_ptraced_process(mmu->id.pid, 1);
++		os_kill_ptraced_process(mmu->id.pid, 0);
+ 		mmu->id.pid = -1;
+ 	}
+ 
+diff --git a/arch/um/os-Linux/process.c b/arch/um/os-Linux/process.c
+index e4bab7955..081cc6665 100644
+--- a/arch/um/os-Linux/process.c
++++ b/arch/um/os-Linux/process.c
+@@ -77,6 +77,12 @@ void os_kill_ptraced_process(int pid, int reap_child)
+ 	unblock_signals();
+ }
+ 
++/* Whether a child process (that nobody waits for) still exists */
++int os_check_alive(int pid)
++{
++	return pid > 0 && kill(pid, 0) == 0;
++}
++
+ pid_t os_reap_child(void)
+ {
+ 	int status;
+-- 
+2.56.0
+

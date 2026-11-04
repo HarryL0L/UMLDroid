@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android 17 UML</string>
+    <string name="subtitle">Android 17 on User-Mode Linux</string>
+    <string name="settings">Settings</string>
+    <string name="settings_note">Changes apply the next time Android starts.</string>
+    <string name="stubthreads">Per-thread stubs (experimental)</string>
+    <string name="stubthreads_note">Lets the threads of an app run at the same time. Warm launches got faster in tests, cold launches slower.</string>
+    <string name="wakelock">Keep running while the screen is off</string>
+    <string name="console">Console</string>
+    <string name="lite">Daily-use trim</string>
+    <string name="lite_note">Turns off system apps that have nothing to do here (Bluetooth, NFC, telephony extras, printing, …) and compiles the always-running apps ahead of time, once, in the background after the first boot with it on. Faster boots, less background work. Turning it off brings them back.</string>
+    <string name="fill">Fill the whole screen (about 25% more drawing)</string>
+    <string name="extranav">Extra navigation buttons below the screen</string>
+    <string name="save_log">Save log to Downloads</string>
+    <string name="storage">Storage</string>
+    <string name="delete_data">Delete Android data</string>
+    <string name="delete_confirm">This deletes Android 17 and everything in it (apps, settings, files). Installing again downloads 1.2 GB.</string>
+    <string name="tips">If Android 17 stops on its own, turn on Developer options → \"Disable child process restrictions\" (Android 14 and later) and close other heavy apps.</string>
+</resources>

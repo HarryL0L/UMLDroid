@@ -1,0 +1,50 @@
+plugins { id "com.android.application" }
+
+android {
+    namespace "dev.uml.android17"
+    compileSdk 34
+    defaultConfig {
+        applicationId "dev.uml.android17"
+        minSdk 26
+        // 28, as Termux: see AndroidManifest.xml
+        //noinspection ExpiredTargetSdkVersion
+        targetSdk 28
+        versionCode 3
+        versionName "0.3"
+        ndk { abiFilters "arm64-v8a" }
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt")
+            signingConfig signingConfigs.debug
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    packaging { jniLibs { useLegacyPackaging true } }
+    lint { abortOnError false; checkReleaseBuilds false }
+    androidResources { noCompress "gzdata" }
+}
+
+dependencies {
+    implementation "com.google.android.material:material:1.12.0"
+    implementation "androidx.appcompat:appcompat:1.7.0"
+}
+
+// The kernel and the guest helpers come from ../kit (not duplicated in git)
+def kit = rootProject.file("../kit")
+tasks.register("syncKitGuest", Copy) {
+    from("${kit}/guest") { include "first_stage.sh", "init.rc", "lite.sh" }
+    from("${kit}/guest/bin-arm64") { include "fixup", "bpfstub", "umlbench" }
+    into "src/main/assets/guest"
+}
+tasks.register("syncKitKernel", Copy) {
+    from("${kit}/bin") { include "linux-arm64" }
+    rename { "libuml.so" }
+    into "src/main/jniLibs/arm64-v8a"
+}
+preBuild.dependsOn("syncKitGuest", "syncKitKernel")
+

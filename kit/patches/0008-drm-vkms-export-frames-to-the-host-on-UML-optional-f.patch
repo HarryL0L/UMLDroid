@@ -1,0 +1,372 @@
+From 876f0e14fd3eeff628516fbc84bef8202f6adac7 Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Mon, 2 Nov 2026 04:18:50 +0000
+Subject: [PATCH 08/12] drm/vkms: export frames to the host on UML, optional
+ fixed mode
+
+vkms.export=<host file> makes vkms compose every committed frame and
+write it as RGBA into a host file mapped with uml_map_host_file(), so a
+viewer outside UML can show the display. A 4 KiB header carries the size
+and a sequence counter that is odd while a frame is being written.
+Frames are composed once per commit, not on every vblank.
+
+vkms.width=/vkms.height= replace the mode list with a single mode of
+that size, for example a portrait phone display.
+---
+ drivers/gpu/drm/vkms/Makefile         |   2 +
+ drivers/gpu/drm/vkms/vkms_composer.c  |  31 ++++++--
+ drivers/gpu/drm/vkms/vkms_connector.c |  24 ++++++
+ drivers/gpu/drm/vkms/vkms_crtc.c      |   5 +-
+ drivers/gpu/drm/vkms/vkms_drv.h       |   1 +
+ drivers/gpu/drm/vkms/vkms_export.c    | 103 ++++++++++++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_export.h    |  25 +++++++
+ 7 files changed, 184 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/gpu/drm/vkms/vkms_export.c
+ create mode 100644 drivers/gpu/drm/vkms/vkms_export.h
+
+diff --git a/drivers/gpu/drm/vkms/Makefile b/drivers/gpu/drm/vkms/Makefile
+index 9bb264091..8818c8217 100644
+--- a/drivers/gpu/drm/vkms/Makefile
++++ b/drivers/gpu/drm/vkms/Makefile
+@@ -13,5 +13,7 @@ vkms-y := \
+ 	vkms_colorop.o \
+ 	vkms_luts.o
+ 
++vkms-$(CONFIG_UML) += vkms_export.o
++
+ obj-$(CONFIG_DRM_VKMS) += vkms.o
+ obj-$(CONFIG_DRM_VKMS_KUNIT_TEST) += tests/
+diff --git a/drivers/gpu/drm/vkms/vkms_composer.c b/drivers/gpu/drm/vkms/vkms_composer.c
+index 83d217085..12b5fde21 100644
+--- a/drivers/gpu/drm/vkms/vkms_composer.c
++++ b/drivers/gpu/drm/vkms/vkms_composer.c
+@@ -16,6 +16,7 @@
+ 
+ #include "vkms_composer.h"
+ #include "vkms_luts.h"
++#include "vkms_export.h"
+ 
+ static u16 pre_mul_blend_channel(u16 src, u16 dst, u16 alpha)
+ {
+@@ -471,7 +472,8 @@ static void blend_line(struct vkms_plane_state *current_plane, int y,
+ static void blend(struct vkms_writeback_job *wb,
+ 		  struct vkms_crtc_state *crtc_state,
+ 		  u32 *crc32, struct line_buffer *stage_buffer,
+-		  struct line_buffer *output_buffer, size_t row_size)
++		  struct line_buffer *output_buffer, size_t row_size,
++		  u8 *export_pixels)
+ {
+ 	struct vkms_plane_state **plane = crtc_state->active_planes;
+ 	u32 n_active_planes = crtc_state->num_active_planes;
+@@ -508,6 +510,9 @@ static void blend(struct vkms_writeback_job *wb,
+ 
+ 		if (wb)
+ 			vkms_writeback_row(wb, output_buffer, y);
++
++		if (export_pixels)
++			vkms_export_row(export_pixels, crtc_x_limit, y, output_buffer);
+ 	}
+ }
+ 
+@@ -541,8 +546,9 @@ static int check_iosys_map(struct vkms_crtc_state *crtc_state)
+ 
+ static int compose_active_planes(struct vkms_writeback_job *active_wb,
+ 				 struct vkms_crtc_state *crtc_state,
+-				 u32 *crc32)
++				 u32 *crc32, bool export)
+ {
++	u8 *export_pixels = NULL;
+ 	size_t line_width, pixel_size = sizeof(struct pixel_argb_u16);
+ 	struct line_buffer output_buffer, stage_buffer;
+ 	int ret = 0;
+@@ -578,8 +584,15 @@ static int compose_active_planes(struct vkms_writeback_job *active_wb,
+ 		goto free_stage_buffer;
+ 	}
+ 
++	if (export)
++		export_pixels = vkms_export_begin(line_width,
++						  crtc_state->base.mode.vdisplay);
++
+ 	blend(active_wb, crtc_state, crc32, &stage_buffer,
+-	      &output_buffer, line_width * pixel_size);
++	      &output_buffer, line_width * pixel_size, export_pixels);
++
++	if (export_pixels)
++		vkms_export_end();
+ 
+ 	kvfree(output_buffer.pixels);
+ free_stage_buffer:
+@@ -605,7 +618,7 @@ void vkms_composer_worker(struct work_struct *work)
+ 	struct drm_crtc *crtc = crtc_state->base.crtc;
+ 	struct vkms_writeback_job *active_wb = crtc_state->active_writeback;
+ 	struct vkms_output *out = drm_crtc_to_vkms_output(crtc);
+-	bool crc_pending, wb_pending;
++	bool crc_pending, wb_pending, export;
+ 	u64 frame_start, frame_end;
+ 	u32 crc32 = 0;
+ 	int ret;
+@@ -618,6 +631,8 @@ void vkms_composer_worker(struct work_struct *work)
+ 	crtc_state->frame_start = 0;
+ 	crtc_state->frame_end = 0;
+ 	crtc_state->crc_pending = false;
++	export = crtc_state->export_pending;
++	crtc_state->export_pending = false;
+ 
+ 	if (crtc->state->gamma_lut) {
+ 		s64 max_lut_index_fp;
+@@ -644,9 +659,9 @@ void vkms_composer_worker(struct work_struct *work)
+ 		return;
+ 
+ 	if (wb_pending)
+-		ret = compose_active_planes(active_wb, crtc_state, &crc32);
++		ret = compose_active_planes(active_wb, crtc_state, &crc32, export);
+ 	else
+-		ret = compose_active_planes(NULL, crtc_state, &crc32);
++		ret = compose_active_planes(NULL, crtc_state, &crc32, export);
+ 
+ 	if (ret)
+ 		return;
+@@ -661,6 +676,10 @@ void vkms_composer_worker(struct work_struct *work)
+ 	/*
+ 	 * The worker can fall behind the vblank hrtimer, make sure we catch up.
+ 	 */
++	/* Frames composed only for export have no CRC consumer. */
++	if (!out->composer_enabled)
++		return;
++
+ 	while (frame_start <= frame_end)
+ 		drm_crtc_add_crc_entry(crtc, true, frame_start++, &crc32);
+ }
+diff --git a/drivers/gpu/drm/vkms/vkms_connector.c b/drivers/gpu/drm/vkms/vkms_connector.c
+index b0a6b212d..4b265b112 100644
+--- a/drivers/gpu/drm/vkms/vkms_connector.c
++++ b/drivers/gpu/drm/vkms/vkms_connector.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ 
++#include <linux/moduleparam.h>
++
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_managed.h>
+@@ -7,6 +9,15 @@
+ 
+ #include "vkms_config.h"
+ #include "vkms_connector.h"
++#include "vkms_export.h"
++
++unsigned int vkms_mode_width;
++module_param_named(width, vkms_mode_width, uint, 0444);
++MODULE_PARM_DESC(width, "Width of the only display mode (0: default mode list)");
++
++unsigned int vkms_mode_height;
++module_param_named(height, vkms_mode_height, uint, 0444);
++MODULE_PARM_DESC(height, "Height of the only display mode (0: default mode list)");
+ 
+ static enum drm_connector_status vkms_connector_detect(struct drm_connector *connector,
+ 						       bool force)
+@@ -46,6 +57,19 @@ static int vkms_conn_get_modes(struct drm_connector *connector)
+ {
+ 	int count;
+ 
++	/* A single mode of the requested size (a phone-shaped display, say). */
++	if (vkms_mode_width && vkms_mode_height) {
++		struct drm_display_mode *mode;
++
++		mode = drm_cvt_mode(connector->dev, vkms_mode_width, vkms_mode_height,
++				    60, false, false, false);
++		if (mode) {
++			mode->type |= DRM_MODE_TYPE_PREFERRED;
++			drm_mode_probed_add(connector, mode);
++			return 1;
++		}
++	}
++
+ 	/* Use the default modes list from DRM */
+ 	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
+ 	drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
+diff --git a/drivers/gpu/drm/vkms/vkms_crtc.c b/drivers/gpu/drm/vkms/vkms_crtc.c
+index 079abfba4..37d3c9671 100644
+--- a/drivers/gpu/drm/vkms/vkms_crtc.c
++++ b/drivers/gpu/drm/vkms/vkms_crtc.c
+@@ -12,6 +12,7 @@
+ #include <drm/drm_vblank_helper.h>
+ 
+ #include "vkms_drv.h"
++#include "vkms_export.h"
+ 
+ static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
+ {
+@@ -29,7 +30,7 @@ static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
+ 	state = output->composer_state;
+ 	spin_unlock(&output->lock);
+ 
+-	if (state && output->composer_enabled) {
++	if (state && (output->composer_enabled || READ_ONCE(state->export_pending))) {
+ 		u64 frame = drm_crtc_accurate_vblank_count(crtc);
+ 
+ 		/* update frame_start only if a queued vkms_composer_worker()
+@@ -188,6 +189,8 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	}
+ 
+ 	vkms_output->composer_state = to_vkms_crtc_state(crtc->state);
++	if (vkms_export_enabled())
++		vkms_output->composer_state->export_pending = true;
+ 
+ 	spin_unlock_irq(&vkms_output->lock);
+ }
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 0933e4ce0..5c5f9472c 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -194,6 +194,7 @@ struct vkms_crtc_state {
+ 
+ 	bool crc_pending;
+ 	bool wb_pending;
++	bool export_pending;
+ 	u64 frame_start;
+ 	u64 frame_end;
+ };
+diff --git a/drivers/gpu/drm/vkms/vkms_export.c b/drivers/gpu/drm/vkms/vkms_export.c
+new file mode 100644
+index 000000000..aef68ea02
+--- /dev/null
++++ b/drivers/gpu/drm/vkms/vkms_export.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Frame export for User-Mode Linux.
++ *
++ * With vkms.export=<host path>, every frame that is committed to the CRTC is
++ * composed and written, as RGBA bytes, into a file on the host that the
++ * kernel maps shared. A viewer outside UML (on Android, the app hosting the
++ * VM) maps the same file and displays it.
++ *
++ * Layout: a 4 KiB header (struct vkms_export_header) followed by the pixels,
++ * width * 4 bytes per row. seq is odd while a frame is being written and is
++ * incremented again when the frame is complete.
++ */
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/string.h>
++#include <drm/drm_fourcc.h>
++#include <asm/host_share.h>
++
++#include "vkms_drv.h"
++#include "vkms_export.h"
++
++#define VKMS_EXPORT_MAGIC	0x42464d55	/* "UMFB" */
++#define VKMS_EXPORT_HDR_SIZE	4096
++
++struct vkms_export_header {
++	u32 magic;
++	u32 version;
++	u32 width;
++	u32 height;
++	u32 stride;
++	u32 format;		/* DRM_FORMAT_ABGR8888: bytes R, G, B, A */
++	u64 seq;
++	u64 frames;
++};
++
++static char *export_path;
++module_param_named(export, export_path, charp, 0444);
++MODULE_PARM_DESC(export, "UML: host file that receives every displayed frame");
++
++static unsigned int export_mb = 16;
++module_param_named(export_mb, export_mb, uint, 0444);
++MODULE_PARM_DESC(export_mb, "UML: size of the frame export file in MiB");
++
++static struct vkms_export_header *export_hdr;
++static bool export_failed;
++
++bool vkms_export_enabled(void)
++{
++	return export_path && *export_path && !export_failed;
++}
++
++u8 *vkms_export_begin(u32 width, u32 height)
++{
++	unsigned long size = (unsigned long)export_mb << 20;
++
++	if (!vkms_export_enabled())
++		return NULL;
++	if (!export_hdr) {
++		export_hdr = uml_map_host_file(export_path, size);
++		if (!export_hdr) {
++			pr_err("vkms: cannot map frame export file %s\n", export_path);
++			export_failed = true;
++			return NULL;
++		}
++		memset(export_hdr, 0, sizeof(*export_hdr));
++		export_hdr->magic = VKMS_EXPORT_MAGIC;
++		export_hdr->version = 1;
++		export_hdr->format = DRM_FORMAT_ABGR8888;
++		pr_info("vkms: exporting frames to host file %s\n", export_path);
++	}
++	if (VKMS_EXPORT_HDR_SIZE + (unsigned long)width * height * 4 > size)
++		return NULL;
++
++	WRITE_ONCE(export_hdr->seq, export_hdr->seq + 1);
++	smp_wmb();
++	export_hdr->width = width;
++	export_hdr->height = height;
++	export_hdr->stride = width * 4;
++	return (u8 *)export_hdr + VKMS_EXPORT_HDR_SIZE;
++}
++
++void vkms_export_row(u8 *pixels, u32 width, int y, const struct line_buffer *line)
++{
++	u8 *dst = pixels + (size_t)y * width * 4;
++
++	for (size_t x = 0; x < line->n_pixels && x < width; x++) {
++		const struct pixel_argb_u16 *p = &line->pixels[x];
++
++		dst[0] = p->r >> 8;
++		dst[1] = p->g >> 8;
++		dst[2] = p->b >> 8;
++		dst[3] = 0xff;
++		dst += 4;
++	}
++}
++
++void vkms_export_end(void)
++{
++	export_hdr->frames++;
++	smp_wmb();
++	WRITE_ONCE(export_hdr->seq, export_hdr->seq + 1);
++}
+diff --git a/drivers/gpu/drm/vkms/vkms_export.h b/drivers/gpu/drm/vkms/vkms_export.h
+new file mode 100644
+index 000000000..acf4c6064
+--- /dev/null
++++ b/drivers/gpu/drm/vkms/vkms_export.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef _VKMS_EXPORT_H_
++#define _VKMS_EXPORT_H_
++
++#include <linux/types.h>
++
++struct line_buffer;
++
++/* Optional mode that replaces the default mode list (vkms.width/height). */
++extern unsigned int vkms_mode_width, vkms_mode_height;
++
++#ifdef CONFIG_UML
++bool vkms_export_enabled(void);
++u8 *vkms_export_begin(u32 width, u32 height);
++void vkms_export_row(u8 *pixels, u32 width, int y, const struct line_buffer *line);
++void vkms_export_end(void);
++#else
++static inline bool vkms_export_enabled(void) { return false; }
++static inline u8 *vkms_export_begin(u32 width, u32 height) { return NULL; }
++static inline void vkms_export_row(u8 *pixels, u32 width, int y,
++				   const struct line_buffer *line) { }
++static inline void vkms_export_end(void) { }
++#endif
++
++#endif /* _VKMS_EXPORT_H_ */
+-- 
+2.43.0
+

@@ -1,0 +1,123 @@
+From 90b19b5d739eedeffea685e1fcfb1835122d1d1d Mon Sep 17 00:00:00 2001
+From: BullyMaguire-lol <temp9040@gmail.com>
+Date: Tue, 3 Nov 2026 18:08:21 +0530
+Subject: [PATCH 16/18] um: optional fault-ahead for sequential anonymous
+ writes
+
+When userspace writes its way through fresh anonymous memory, populate
+the following pages of the run (faultahead=<pages>) together with the
+faulting one, so that their host mappings go out in one stub batch.
+Only runs where the previous page is present are extended; shared,
+grows-down, read-only and userfaultfd VMAs are left alone.
+
+Off by default: on a Dimensity 1200 phone the page fault benchmark got
+slower with faultahead=15 (31-40 us per page vs 20-22 us), in three A/B
+pairs. Kept for experiments.
+---
+ arch/um/kernel/trap.c | 76 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index deb13f33e..66dae450e 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/uaccess.h>
+ #include <linux/sched/debug.h>
++#include <linux/userfaultfd_k.h>
+ #include <asm/current.h>
+ #include <asm/tlbflush.h>
+ #include <arch.h>
+@@ -17,6 +18,78 @@
+ #include <os.h>
+ #include <skas.h>
+ 
++/*
++ * Fault-ahead for anonymous memory: every page fault costs a round trip to
++ * the stub on UML (about 10 times a native one), so when userspace writes
++ * its way through fresh anonymous memory page by page, populate the next
++ * pages of that run along with the faulting one. Their mappings go to the
++ * host in the same batch. Only sequential runs (the page before the fault
++ * is present) are extended, which bounds the memory populated in vain.
++ * faultahead=<pages> enables it.
++ */
++/* Off by default: measured slower on a phone (faultahead=15: 40 vs 20 us) */
++static unsigned int fault_ahead_pages;
++
++static int __init fault_ahead_setup(char *str)
++{
++	return kstrtouint(str, 0, &fault_ahead_pages) == 0;
++}
++__setup("faultahead=", fault_ahead_setup);
++
++static pte_t *um_pte_lookup(struct mm_struct *mm, unsigned long addr)
++{
++	pgd_t *pgd = pgd_offset(mm, addr);
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++
++	if (!pgd_present(*pgd))
++		return NULL;
++	p4d = p4d_offset(pgd, addr);
++	if (!p4d_present(*p4d))
++		return NULL;
++	pud = pud_offset(p4d, addr);
++	if (!pud_present(*pud))
++		return NULL;
++	pmd = pmd_offset(pud, addr);
++	if (!pmd_present(*pmd))
++		return NULL;
++	return pte_offset_kernel(pmd, addr);
++}
++
++static void fault_ahead(struct vm_area_struct *vma, unsigned long address,
++			unsigned int flags)
++{
++	struct mm_struct *mm = vma->vm_mm;
++	unsigned long addr = (address & PAGE_MASK) + PAGE_SIZE;
++	unsigned long end;
++	pte_t *pte;
++
++	/* Not where missing pages mean something (userfaultfd: ART's GC) */
++	if (!vma_is_anonymous(vma) || (vma->vm_flags & (VM_SHARED | VM_GROWSDOWN)) ||
++	    !(vma->vm_flags & VM_WRITE) || userfaultfd_armed(vma))
++		return;
++
++	/* Sequential runs only */
++	if ((address & PAGE_MASK) == vma->vm_start)
++		return;
++	pte = um_pte_lookup(mm, (address & PAGE_MASK) - PAGE_SIZE);
++	if (!pte || !pte_present(*pte))
++		return;
++
++	end = min(vma->vm_end, addr + fault_ahead_pages * PAGE_SIZE);
++	/* Never drop the mmap lock here */
++	flags &= ~(FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
++		   FAULT_FLAG_INTERRUPTIBLE);
++	for (; addr < end; addr += PAGE_SIZE) {
++		pte = um_pte_lookup(mm, addr);
++		if (pte && !pte_none(*pte))
++			break;
++		if (handle_mm_fault(vma, addr, flags, NULL) & VM_FAULT_ERROR)
++			break;
++	}
++}
++
+ /*
+  * NOTE: UML does not have exception tables. As such, this is almost a copy
+  * of the code in mm/memory.c, only adjusting the logic to simply check whether
+@@ -207,6 +280,9 @@ int handle_page_fault(unsigned long address, unsigned long ip,
+ 		pte = pte_offset_kernel(pmd, address);
+ 	} while (!pte_present(*pte));
+ 	err = 0;
++
++	if (is_user && (flags & FAULT_FLAG_WRITE) && fault_ahead_pages)
++		fault_ahead(vma, address, flags);
+ 	/*
+ 	 * The below warning was added in place of
+ 	 *	pte_mkyoung(); if (is_write) pte_mkdirty();
+-- 
+2.56.0
+

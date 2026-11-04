@@ -1,0 +1,29 @@
+#!/bin/bash
+# clang for arm64 UML linked against Termux's glibc (static), like the port's
+# toolchain/aarch64-glibc-gcc but on an x86_64 build machine: Termux's glibc
+# avoids system calls that Android's app seccomp filter kills (rseq,
+# set_robust_list). TERMUX_GLIBC points at an unpacked glibc package's
+# .../usr/glibc directory.
+G=${TERMUX_GLIBC:-/mnt/s/termux-glibc/x/data/data/com.termux/files/usr/glibc}
+RD=$(clang -print-resource-dir)
+link=1; startfiles=1; stdinc=1
+for a in "$@"; do
+	case "$a" in
+	-c|-S|-E|-M|-MM) link=0;;
+	-nostdlib|-nostartfiles|-shared|-r) startfiles=0;;
+	-nostdinc) stdinc=0;;
+	esac
+done
+inc=(); pre=(); post=()
+# Kernel UAPI headers (asm/, linux/) come from Linux, not glibc.
+UAPI=${UAPI_HEADERS:-/mnt/s/termux-glibc/uapi}
+[ $stdinc = 1 ] && inc=(-isystem $RD/include -isystem $G/include -isystem $UAPI -nostdlibinc)
+if [ $link = 1 ]; then
+	pre=(--ld-path=/usr/bin/aarch64-linux-gnu-ld.bfd --rtlib=libgcc --unwindlib=libgcc -L$G/lib)
+	if [ $startfiles = 1 ]; then
+		pre+=(-nostartfiles $G/lib/crt1.o $G/lib/crti.o)
+		post=($G/lib/crtn.o)
+	fi
+fi
+exec clang --target=aarch64-linux-gnu "${inc[@]}" "${pre[@]}" "$@" "${post[@]}" \
+	-Wno-unused-command-line-argument

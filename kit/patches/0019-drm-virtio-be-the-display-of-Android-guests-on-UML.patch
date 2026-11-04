@@ -1,0 +1,119 @@
+From c6d2ae896337dded5c2fe06d066f5da98f2f7d78 Mon Sep 17 00:00:00 2001
+From: UML Android <uml@localhost>
+Date: Tue, 3 Nov 2026 20:37:30 +0000
+Subject: [PATCH] drm/virtio: be the display of Android guests on UML
+
+With a vhost-user virtio-gpu backend (virtio_uml), Android's composer and
+minigbm drive virtio-gpu like they drive vkms on UML:
+
+- minigbm allocates dumb buffers from the render node (render_dumb_buffers);
+- only the display's own mode is offered (no list of standard modes the
+  composer might pick and then fail to scan out with ERANGE);
+- RGBA buffers (ABGR8888, XBGR8888), Android's format, can be framebuffers,
+  and dumb buffers are R8G8B8A8 on the host so that they show correctly.
+---
+ drivers/gpu/drm/virtio/virtgpu_display.c | 13 +++++++++++--
+ drivers/gpu/drm/virtio/virtgpu_drv.c     |  5 +++++
+ drivers/gpu/drm/virtio/virtgpu_gem.c     |  8 +++++++-
+ drivers/gpu/drm/virtio/virtgpu_plane.c   | 12 ++++++++++++
+ 4 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index a1a875a0c..14b21f357 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -192,7 +192,13 @@ static int virtio_gpu_conn_get_modes(struct drm_connector *connector)
+ 
+ 	width  = le32_to_cpu(output->info.r.width);
+ 	height = le32_to_cpu(output->info.r.height);
+-	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
++	/*
++	 * On UML the device is the fixed-size display of an Android guest:
++	 * offer only its mode, as vkms does there, so that the composer never
++	 * picks a standard mode that its buffers do not match.
++	 */
++	count = IS_ENABLED(CONFIG_UML) && width && height ? 0 :
++		drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
+ 
+ 	if (width == 0 || height == 0) {
+ 		drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
+@@ -326,7 +332,10 @@ virtio_gpu_user_framebuffer_create(struct drm_device *dev,
+ 	int ret;
+ 
+ 	if (mode_cmd->pixel_format != DRM_FORMAT_HOST_XRGB8888 &&
+-	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888)
++	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888 &&
++	    !(IS_ENABLED(CONFIG_UML) &&
++	      (mode_cmd->pixel_format == DRM_FORMAT_ABGR8888 ||
++	       mode_cmd->pixel_format == DRM_FORMAT_XBGR8888)))
+ 		return ERR_PTR(-ENOENT);
+ 
+ 	/* lookup object associated with res handle */
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index 52c174f9b..8ffa604e6 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -327,6 +327,11 @@ MODULE_AUTHOR("Alon Levy");
+ DEFINE_DRM_GEM_FOPS(virtio_gpu_driver_fops);
+ 
+ static const struct drm_driver driver = {
++	/*
++	 * On UML the virtio GPU is the display of Android guests: without 3D,
++	 * minigbm allocates dumb buffers from the render node (as with vkms).
++	 */
++	.render_dumb_buffers = IS_ENABLED(CONFIG_UML),
+ 	/*
+ 	 * If KMS is disabled DRIVER_MODESET and DRIVER_ATOMIC are masked
+ 	 * out via drm_device::driver_features:
+diff --git a/drivers/gpu/drm/virtio/virtgpu_gem.c b/drivers/gpu/drm/virtio/virtgpu_gem.c
+index d2f0b8a3f..4e7e0d55b 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_gem.c
++++ b/drivers/gpu/drm/virtio/virtgpu_gem.c
+@@ -75,7 +75,13 @@ int virtio_gpu_mode_dumb_create(struct drm_file *file_priv,
+ 	args->size = pitch * args->height;
+ 	args->size = ALIGN(args->size, PAGE_SIZE);
+ 
+-	params.format = virtio_gpu_translate_format(DRM_FORMAT_HOST_XRGB8888);
++	/*
++	 * The host format of a dumb buffer only matters for showing it. On UML
++	 * they are an Android guest's buffers, which hold RGBA (ABGR8888).
++	 */
++	params.format = virtio_gpu_translate_format(IS_ENABLED(CONFIG_UML) ?
++						    DRM_FORMAT_ABGR8888 :
++						    DRM_FORMAT_HOST_XRGB8888);
+ 	params.width = args->width;
+ 	params.height = args->height;
+ 	params.size = args->size;
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 640815af4..9fc9d7704 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -37,6 +37,12 @@
+ 
+ static const uint32_t virtio_gpu_formats[] = {
+ 	DRM_FORMAT_HOST_XRGB8888,
++#ifdef CONFIG_UML
++	/* Android's buffers (see virtio_gpu_mode_dumb_create) */
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ARGB8888,
++#endif
+ };
+ 
+ static const uint32_t virtio_gpu_cursor_formats[] = {
+@@ -60,6 +66,12 @@ uint32_t virtio_gpu_translate_format(uint32_t drm_fourcc)
+ 	case DRM_FORMAT_BGRA8888:
+ 		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
+ 		break;
++	case DRM_FORMAT_ABGR8888:
++		format = VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM;
++		break;
++	case DRM_FORMAT_XBGR8888:
++		format = VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM;
++		break;
+ 	default:
+ 		/*
+ 		 * This should not happen, we handle everything listed
+-- 
+2.43.0
+

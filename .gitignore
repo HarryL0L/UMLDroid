@@ -1,0 +1,18 @@
+# Android's data and downloads (setup.sh)
+kit/android/
+# built binaries: kernels, umlgpu (see kit/bin/README.md)
+kit/bin/*
+!kit/bin/README.md
+*.sock
+# app build
+app/.gradle/
+app/build/
+app/app/build/
+app/local.properties
+app/app/src/main/jniLibs/
+app/app/src/main/assets/guest/
+*.apk
+*.keystore
+*.jks
+# gfxstream build trees
+gfxstream-build/

@@ -1,0 +1,106 @@
+From bbe2caf64413dfa345053ede73c2a2cd703d6764 Mon Sep 17 00:00:00 2001
+From: UML Android <uml@localhost>
+Date: Tue, 3 Nov 2026 04:02:29 +0000
+Subject: [PATCH] um: do not preempt a task between its TLB sync and the stub
+ handover
+
+With stub threads, the page table changes of an address space are queued
+for the stub with a ticket, and stub threads execute batches in ticket
+order. A task preempted after taking its ticket but before handing the
+batch to its stub (e.g. at the preempt_enable() of the sync_tlb_lock
+release) leaves the stubs of the other threads waiting for it, while their
+CPU threads wait for those stubs. Once every CPU does, the preempted task
+never runs again: Android's apexd hung the whole kernel this way.
+
+Disable preemption from the sync until the handover. Reschedules requested
+meanwhile happen when userspace next traps, which IRQs force.
+---
+ arch/um/include/shared/skas/skas.h |  1 +
+ arch/um/kernel/skas/process.c      | 19 +++++++++++++++++++
+ arch/um/os-Linux/skas/process.c    |  6 ++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/arch/um/include/shared/skas/skas.h b/arch/um/include/shared/skas/skas.h
+index d60c35abd..99ea46808 100644
+--- a/arch/um/include/shared/skas/skas.h
++++ b/arch/um/include/shared/skas/skas.h
+@@ -22,6 +22,7 @@ extern int start_stub_thread(struct mm_id *proc, struct mm_id *thread,
+ 			     unsigned long slot);
+ extern void stop_stub_thread(struct mm_id *thread);
+ extern void current_mm_sync(void);
++extern void current_mm_handed_over(void);
+ void initial_jmpbuf_lock(void);
+ void initial_jmpbuf_unlock(void);
+ 
+diff --git a/arch/um/kernel/skas/process.c b/arch/um/kernel/skas/process.c
+index d6e51c4cb..3f6766af6 100644
+--- a/arch/um/kernel/skas/process.c
++++ b/arch/um/kernel/skas/process.c
+@@ -58,14 +58,33 @@ void um_alarm_current_stub(void)
+ 		os_alarm_stub(mm_id->tgid, mm_id->pid);
+ }
+ 
++/*
++ * Syncing the page tables before resuming userspace queues the changes for
++ * the task's stub and gives the batch a ticket: stub threads execute the
++ * batches of an address space in ticket order. Until the batch has been
++ * handed to the stub, the task must not be preempted. Otherwise the stubs of
++ * other threads wait for its ticket while their CPUs wait for them, and once
++ * all CPUs do, nothing runs the preempted task again.
++ * current_mm_handed_over() ends this once the stub has the batch.
++ */
+ void current_mm_sync(void)
+ {
+ 	if (current->mm == NULL)
+ 		return;
+ 
++	preempt_disable();
+ 	um_tlb_sync(current->mm);
+ }
+ 
++void current_mm_handed_over(void)
++{
++	if (current->mm == NULL)
++		return;
++
++	/* Any reschedule happens when userspace next traps (IRQs kick it) */
++	preempt_enable_no_resched();
++}
++
+ static DEFINE_SPINLOCK(initial_jmpbuf_spinlock);
+ 
+ void initial_jmpbuf_lock(void)
+diff --git a/arch/um/os-Linux/skas/process.c b/arch/um/os-Linux/skas/process.c
+index e4dd496eb..830ccbabb 100644
+--- a/arch/um/os-Linux/skas/process.c
++++ b/arch/um/os-Linux/skas/process.c
+@@ -241,6 +241,10 @@ void wait_stub_done_seccomp(struct mm_id *mm_idp, int running, int wait_sigsys)
+ 					    __ATOMIC_SEQ_CST))
+ 				CATCH_EINTR(syscall(__NR_futex, &data->futex,
+ 						    FUTEX_WAKE, 1, NULL, NULL, 0));
++
++			/* Resuming userspace (see current_mm_sync) */
++			if (!wait_sigsys)
++				current_mm_handed_over();
+ 		}
+ 
+ 		/* Userspace often traps again quickly, spin before sleeping */
+@@ -701,6 +705,7 @@ void userspace(struct uml_pt_regs *regs)
+ 
+ 			err = set_stub_state(regs, proc_data, singlestepping());
+ 			if (err) {
++				current_mm_handed_over();
+ 				printk(UM_KERN_ERR "%s - failed to set regs: %d",
+ 				       __func__, err);
+ 				fatal_sigsegv();
+@@ -755,6 +760,7 @@ void userspace(struct uml_pt_regs *regs)
+ 
+ 			/* Flush out any pending syscalls */
+ 			err = syscall_stub_flush(mm_id);
++			current_mm_handed_over();
+ 			if (err) {
+ 				if (err == -ENOMEM)
+ 					report_enomem();
+-- 
+2.43.0
+

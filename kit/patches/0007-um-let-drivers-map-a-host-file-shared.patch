@@ -1,0 +1,184 @@
+From 29712155735234eec0815797b3d4016068c141b6 Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Mon, 2 Nov 2026 04:18:49 +0000
+Subject: [PATCH 07/12] um: let drivers map a host file shared
+
+Add uml_map_host_file(), which creates a host file of a given size and
+maps it shared into the kernel. Drivers can use it to hand data to
+programs running next to UML on the host, such as a display's frames.
+---
+ arch/um/include/asm/host_share.h | 11 ++++++
+ arch/um/include/shared/os.h      |  1 +
+ arch/um/kernel/Makefile          |  2 +-
+ arch/um/kernel/Makefile.orig     | 67 ++++++++++++++++++++++++++++++++
+ arch/um/kernel/host_share.c      | 10 +++++
+ arch/um/os-Linux/file.c          | 22 +++++++++++
+ 6 files changed, 112 insertions(+), 1 deletion(-)
+ create mode 100644 arch/um/include/asm/host_share.h
+ create mode 100644 arch/um/kernel/Makefile.orig
+ create mode 100644 arch/um/kernel/host_share.c
+
+diff --git a/arch/um/include/asm/host_share.h b/arch/um/include/asm/host_share.h
+new file mode 100644
+index 000000000..8958fa548
+--- /dev/null
++++ b/arch/um/include/asm/host_share.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_HOST_SHARE_H
++#define __UM_HOST_SHARE_H
++
++/*
++ * Map a host file shared into the kernel's address space. Drivers use it to
++ * hand data (a display's frames, for example) to programs on the host.
++ */
++void *uml_map_host_file(const char *path, unsigned long size);
++
++#endif
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index ea8f6be62..8f30f2043 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -147,6 +147,7 @@ extern int os_mode_fd(int fd, int mode);
+ 
+ extern int os_seek_file(int fd, unsigned long long offset);
+ extern int os_open_file(const char *file, struct openflags flags, int mode);
++extern void *os_map_shared_file(const char *path, unsigned long size);
+ extern int os_read_file(int fd, void *buf, int len);
+ extern int os_write_file(int fd, const void *buf, int count);
+ extern int os_sync_file(int fd);
+diff --git a/arch/um/kernel/Makefile b/arch/um/kernel/Makefile
+index 3dccacf53..04a7adc02 100644
+--- a/arch/um/kernel/Makefile
++++ b/arch/um/kernel/Makefile
+@@ -18,7 +18,7 @@ obj-y = config.o exec.o exitcode.o irq.o ksyms.o mem.o \
+ 	physmem.o process.o ptrace.o reboot.o sigio.o \
+ 	signal.o sysrq.o time.o tlb.o trap.o \
+ 	um_arch.o umid.o kmsg_dump.o skas/
+-obj-y += load_file.o
++obj-y += load_file.o host_share.o
+ obj-$(CONFIG_UML_X86) += capflags.o
+ 
+ obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
+diff --git a/arch/um/kernel/Makefile.orig b/arch/um/kernel/Makefile.orig
+new file mode 100644
+index 000000000..3dccacf53
+--- /dev/null
++++ b/arch/um/kernel/Makefile.orig
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux,intel}.com)
++#
++
++# Don't instrument UML-specific code; without this, we may crash when
++# accessing the instrumentation buffer for the first time from the
++# kernel.
++KCOV_INSTRUMENT                := n
++
++CPPFLAGS_vmlinux.lds := -DSTART=$(LDS_START)		\
++                        -DELF_ARCH=$(LDS_ELF_ARCH)	\
++                        -DELF_FORMAT=$(LDS_ELF_FORMAT)	\
++			$(LDS_EXTRA)
++always-$(KBUILD_BUILTIN) := vmlinux.lds
++
++obj-y = config.o exec.o exitcode.o irq.o ksyms.o mem.o \
++	physmem.o process.o ptrace.o reboot.o sigio.o \
++	signal.o sysrq.o time.o tlb.o trap.o \
++	um_arch.o umid.o kmsg_dump.o skas/
++obj-y += load_file.o
++obj-$(CONFIG_UML_X86) += capflags.o
++
++obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
++obj-$(CONFIG_GPROF)	+= gprof_syms.o
++obj-$(CONFIG_OF) += dtb.o
++obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
++obj-$(CONFIG_STACKTRACE) += stacktrace.o
++obj-$(CONFIG_SMP) += smp.o
++obj-$(CONFIG_BPF_JIT) += bpf_jit_thunk.o
++
++USER_OBJS := config.o
++
++include $(srctree)/arch/um/scripts/Makefile.rules
++
++targets := config.c config.tmp capflags.c
++
++# Be careful with the below Sed code - sed is pitfall-rich!
++# We use sed to lower build requirements, for "embedded" builders for instance.
++
++$(obj)/config.tmp: $(objtree)/.config FORCE
++	$(call if_changed,quote1)
++
++quiet_cmd_quote1 = QUOTE   $@
++      cmd_quote1 = sed -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n",/' \
++		   $< > $@
++
++$(obj)/config.c: $(src)/config.c.in $(obj)/config.tmp FORCE
++	$(call if_changed,quote2)
++
++quiet_cmd_mkcapflags = MKCAP   $@
++      cmd_mkcapflags = $(CONFIG_SHELL) $(src)/../../x86/kernel/cpu/mkcapflags.sh $@ $^
++
++cpufeature = $(src)/../../x86/include/asm/cpufeatures.h
++vmxfeature = $(src)/../../x86/include/asm/vmxfeatures.h
++
++$(obj)/capflags.c: $(cpufeature) $(vmxfeature) $(src)/../../x86/kernel/cpu/mkcapflags.sh FORCE
++	$(call if_changed,mkcapflags)
++
++quiet_cmd_quote2 = QUOTE   $@
++      cmd_quote2 = sed -e '/CONFIG/{'          \
++		  -e 's/"CONFIG"//'            \
++		  -e 'r $(obj)/config.tmp'     \
++		  -e 'a \'                     \
++		  -e '""'                      \
++		  -e '}'                       \
++		  $< > $@
+diff --git a/arch/um/kernel/host_share.c b/arch/um/kernel/host_share.c
+new file mode 100644
+index 000000000..e787b5250
+--- /dev/null
++++ b/arch/um/kernel/host_share.c
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/export.h>
++#include <asm/host_share.h>
++#include <os.h>
++
++void *uml_map_host_file(const char *path, unsigned long size)
++{
++	return os_map_shared_file(path, size);
++}
++EXPORT_SYMBOL_GPL(uml_map_host_file);
+diff --git a/arch/um/os-Linux/file.c b/arch/um/os-Linux/file.c
+index 21f0e50fb..b36311e88 100644
+--- a/arch/um/os-Linux/file.c
++++ b/arch/um/os-Linux/file.c
+@@ -724,3 +724,25 @@ void *os_mremap_rw_shared(void *old_addr, size_t old_size, size_t new_size)
+ 
+ 	return res;
+ }
++
++/*
++ * Create (or reuse) a host file of the given size and map it shared, so a
++ * process outside UML can see what the kernel writes there. Returns NULL
++ * on failure.
++ */
++void *os_map_shared_file(const char *path, unsigned long size)
++{
++	void *p;
++	int fd;
++
++	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++	if (fd < 0)
++		return NULL;
++	if (ftruncate(fd, size) < 0) {
++		close(fd);
++		return NULL;
++	}
++	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	close(fd);
++	return p == MAP_FAILED ? NULL : p;
++}
+-- 
+2.43.0
+

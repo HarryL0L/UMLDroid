@@ -1,0 +1,6 @@
+#!/bin/bash
+# clang cross-compiler for arm64 UML, mirroring the port's
+# toolchain/aarch64-glibc-gcc: static links use GNU ld and libgcc from the
+# aarch64-linux-gnu cross toolchain.
+exec clang --target=aarch64-linux-gnu --ld-path=/usr/bin/aarch64-linux-gnu-ld.bfd \
+	--rtlib=libgcc --unwindlib=libgcc "$@" -Wno-unused-command-line-argument

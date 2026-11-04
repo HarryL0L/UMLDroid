@@ -1,0 +1,53 @@
+# Boot script for Android on UML: androidboot.init_rc=/dev/uml/init.rc.
+# first_stage.sh copies it and the helpers from the initramfs to /dev/uml, so
+# rerunning setup.sh updates them. It runs the guest fixups first, then the
+# stock init scripts.
+on early-init
+    exec u:r:su:s0 root root -- /dev/uml/fixup
+    # Cuttlefish waits 5 s for a network card that UML does not have
+    setprop ro.vendor.disable_rename_eth0 1
+
+# ubd nodes are created root-only; give the partitions system services open
+# directly the owners Cuttlefish's ueventd rules would.
+on post-fs
+    chown system system /dev/block/ubda13
+    chmod 0660 /dev/block/ubda13
+
+# Empty stand-ins for BPF maps whose (tracepoint) programs cannot load on
+# UML but that system services open unconditionally.
+on property:bpf.progs_loaded=1
+    exec u:r:su:s0 root root -- /dev/uml/bpfstub
+
+# Services that cannot work without Cuttlefish's host or that UML's sandbox
+# rejects: once one has crashed, leave it stopped instead of restarting it
+# every few seconds (each restart costs a lot on UML).
+on property:init.svc.seriallogging=restarting
+    stop seriallogging
+on property:init.svc.mediaextractor=restarting
+    stop mediaextractor
+on property:init.svc.media.swcodec=restarting
+    stop media.swcodec
+
+# Everything is drawn in software: no animations. Stay awake and unlocked
+# (the virtual battery always reports charging): going to sleep behind the
+# lock screen makes every app launch wait for keyguard timeouts.
+on property:sys.boot_completed=1
+    exec u:r:su:s0 root root -- /system/bin/settings put global window_animation_scale 0
+    exec u:r:su:s0 root root -- /system/bin/settings put global transition_animation_scale 0
+    exec u:r:su:s0 root root -- /system/bin/settings put global animator_duration_scale 0
+    exec u:r:su:s0 root root -- /system/bin/settings put global stay_on_while_plugged_in 7
+    exec u:r:su:s0 root root -- /system/bin/settings put system screen_off_timeout 1800000
+    exec u:r:su:s0 root root -- /system/bin/locksettings set-disabled true
+
+# androidboot.uml_lite=1: the "daily use" trim (lite.sh), =0 undoes it
+on property:sys.boot_completed=1 && property:ro.boot.uml_lite=1
+    exec_background u:r:su:s0 root root -- /dev/uml/lite.sh on
+on property:sys.boot_completed=1 && property:ro.boot.uml_lite=0
+    exec_background u:r:su:s0 root root -- /dev/uml/lite.sh off
+
+import /system/etc/init/hw/init.rc
+import /system/etc/init
+import /system_ext/etc/init
+import /vendor/etc/init
+import /odm/etc/init
+import /product/etc/init

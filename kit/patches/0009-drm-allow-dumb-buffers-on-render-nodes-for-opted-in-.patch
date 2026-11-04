@@ -1,0 +1,92 @@
+From 5e1971dba102c3ad6fd77cb00783fc0a5bd0dc8f Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Mon, 2 Nov 2026 04:18:50 +0000
+Subject: [PATCH 09/12] drm: allow dumb buffers on render nodes for opted-in
+ drivers; vkms on UML
+
+The kernel makes the first opener of a primary node DRM master. With vkms
+as an Android display, minigbm (which has no render node to use) opened
+the primary node before the composer and became master, so the composer
+fell back to a headless display. Add drm_driver.render_dumb_buffers to
+allow the dumb-buffer ioctls on the render node, and give vkms a render
+node with it on UML: minigbm prefers render nodes, and the composer is
+then the only primary-node client.
+---
+ drivers/gpu/drm/drm_ioctl.c     | 10 +++++++++-
+ drivers/gpu/drm/vkms/vkms_drv.c |  9 ++++++++-
+ include/drm/drm_drv.h           | 11 +++++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index 9039a39c4..6fa8965d7 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -840,6 +840,7 @@ long drm_ioctl(struct file *filp,
+ 	drm_ioctl_t *func;
+ 	unsigned int nr = DRM_IOCTL_NR(cmd);
+ 	int retcode = -EINVAL;
++	u32 flags;
+ 	char stack_kdata[128];
+ 	char *kdata = NULL;
+ 	unsigned int in_size, out_size, drv_size, ksize;
+@@ -911,7 +912,14 @@ long drm_ioctl(struct file *filp,
+ 	if (ksize > in_size)
+ 		memset(kdata + in_size, 0, ksize - in_size);
+ 
+-	retcode = drm_ioctl_kernel(filp, func, kdata, ioctl->flags);
++	flags = ioctl->flags;
++	if (dev->driver->render_dumb_buffers && drm_is_render_client(file_priv) &&
++	    (ioctl->cmd == DRM_IOCTL_MODE_CREATE_DUMB ||
++	     ioctl->cmd == DRM_IOCTL_MODE_MAP_DUMB ||
++	     ioctl->cmd == DRM_IOCTL_MODE_DESTROY_DUMB))
++		flags |= DRM_RENDER_ALLOW;
++
++	retcode = drm_ioctl_kernel(filp, func, kdata, flags);
+ 	if (copy_to_user((void __user *)arg, kdata, out_size) != 0)
+ 		retcode = -EFAULT;
+ 
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.c b/drivers/gpu/drm/vkms/vkms_drv.c
+index 5a640b531..2cbab566a 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -91,7 +91,14 @@ static void vkms_atomic_commit_tail(struct drm_atomic_commit *old_state)
+ }
+ 
+ static const struct drm_driver vkms_driver = {
+-	.driver_features	= DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM,
++	.driver_features	= DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM |
++				  (IS_ENABLED(CONFIG_UML) ? DRIVER_RENDER : 0),
++	/*
++	 * On UML, vkms is the display of Android guests: let minigbm allocate
++	 * from the render node so that only the composer opens the primary
++	 * node and becomes DRM master.
++	 */
++	.render_dumb_buffers	= IS_ENABLED(CONFIG_UML),
+ 	.fops			= &vkms_driver_fops,
+ 	DRM_GEM_SHMEM_DRIVER_OPS,
+ 	DRM_FBDEV_SHMEM_DRIVER_OPS,
+diff --git a/include/drm/drm_drv.h b/include/drm/drm_drv.h
+index b23830494..a12696ddc 100644
+--- a/include/drm/drm_drv.h
++++ b/include/drm/drm_drv.h
+@@ -406,6 +406,17 @@ struct drm_driver {
+ 	 */
+ 	u32 driver_features;
+ 
++	/**
++	 * @render_dumb_buffers:
++	 *
++	 * Also allow the dumb-buffer ioctls on the render node. For virtual
++	 * KMS drivers whose buffers are plain shared memory, this lets buffer
++	 * allocators use the render node instead of the primary node, where
++	 * opening the device first would make them DRM master and lock the
++	 * display server out.
++	 */
++	bool render_dumb_buffers;
++
+ 	/**
+ 	 * @ioctls:
+ 	 *
+-- 
+2.43.0
+

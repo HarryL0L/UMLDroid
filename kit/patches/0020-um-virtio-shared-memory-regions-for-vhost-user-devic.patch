@@ -1,0 +1,589 @@
+From 58452c20ff9ab08c625756b8ccbd155242144d55 Mon Sep 17 00:00:00 2001
+From: UML Android <uml@localhost>
+Date: Tue, 3 Nov 2026 23:21:22 +0000
+Subject: [PATCH] um: virtio shared memory regions for vhost-user devices
+
+virtio-gpu's host-visible memory (and other virtio shared memory regions)
+are guest physical ranges whose contents live in the device backend. With
+VHOST_USER_PROTOCOL_F_SHMEM, virtio_uml asks the backend for the region
+sizes (GET_SHMEM_CONFIG), reserves guest physical windows for them above RAM
+(get_shm_region()), and maps the host files the backend passes with
+SHMEM_MAP requests there, removing them on SHMEM_UNMAP.
+
+- physmem.c keeps a registry of the mapped ranges: phys_mapping() resolves
+  them, so userspace mappings of such pages map the backend's file directly
+  in the stub, and the kernel keeps its own mapping for user copies.
+- User copies (uaccess.c) use that mapping for pages outside RAM.
+- The stubs' FD cache keeps only the RAM file: shared memory FDs are closed
+  again and their numbers reused.
+---
+ arch/um/drivers/vhost_user.h     |  27 +++++-
+ arch/um/drivers/virtio_uml.c     | 121 +++++++++++++++++++++++--
+ arch/um/include/asm/shm_window.h |  19 ++++
+ arch/um/include/shared/os.h      |   3 +
+ arch/um/kernel/physmem.c         | 147 +++++++++++++++++++++++++++++++
+ arch/um/kernel/skas/uaccess.c    |  13 +++
+ arch/um/os-Linux/file.c          |   9 ++
+ arch/um/os-Linux/skas/mem.c      |   8 +-
+ 8 files changed, 338 insertions(+), 9 deletions(-)
+ create mode 100644 arch/um/include/asm/shm_window.h
+
+diff --git a/arch/um/drivers/vhost_user.h b/arch/um/drivers/vhost_user.h
+index fcfa3b7e0..22ff483ad 100644
+--- a/arch/um/drivers/vhost_user.h
++++ b/arch/um/drivers/vhost_user.h
+@@ -15,6 +15,7 @@
+ #define VHOST_USER_PROTOCOL_F_SLAVE_REQ			5
+ #define VHOST_USER_PROTOCOL_F_CONFIG			9
+ #define VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS	14
++#define VHOST_USER_PROTOCOL_F_SHMEM			20
+ /* Vring state index masks */
+ #define VHOST_USER_VRING_INDEX_MASK	0xff
+ #define VHOST_USER_VRING_POLL_MASK	BIT(8)
+@@ -28,7 +29,8 @@
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_REPLY_ACK) | \
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_SLAVE_REQ) | \
+ 					 BIT_ULL(VHOST_USER_PROTOCOL_F_CONFIG) | \
+-					 BIT_ULL(VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS))
++					 BIT_ULL(VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS) | \
++					 BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM))
+ 
+ enum vhost_user_request {
+ 	VHOST_USER_GET_FEATURES = 1,
+@@ -57,6 +59,7 @@ enum vhost_user_request {
+ 	VHOST_USER_GET_CONFIG = 24,
+ 	VHOST_USER_SET_CONFIG = 25,
+ 	VHOST_USER_VRING_KICK = 35,
++	VHOST_USER_GET_SHMEM_CONFIG = 44,
+ };
+ 
+ enum vhost_user_slave_request {
+@@ -64,6 +67,8 @@ enum vhost_user_slave_request {
+ 	VHOST_USER_SLAVE_CONFIG_CHANGE_MSG = 2,
+ 	VHOST_USER_SLAVE_VRING_HOST_NOTIFIER_MSG = 3,
+ 	VHOST_USER_SLAVE_VRING_CALL = 4,
++	VHOST_USER_SLAVE_SHMEM_MAP = 9,
++	VHOST_USER_SLAVE_SHMEM_UNMAP = 10,
+ };
+ 
+ struct vhost_user_header {
+@@ -107,12 +112,32 @@ struct vhost_user_mem_regions {
+ 	struct vhost_user_mem_region regions[2]; /* Currently supporting 2 */
+ } __packed;
+ 
++/* VHOST_USER_GET_SHMEM_CONFIG reply */
++#define VHOST_USER_MAX_SHMEM_REGIONS	256
++struct vhost_user_shmem_config {
++	u32 nregions;
++	u32 padding;
++	u64 memory_sizes[VHOST_USER_MAX_SHMEM_REGIONS];
++} __packed;
++
++/* VHOST_USER_SLAVE_SHMEM_MAP / _UNMAP, the fd comes with _MAP */
++#define VHOST_USER_FLAG_MAP_RW		BIT(0)
++struct vhost_user_mmap {
++	u8 shmid;
++	u8 padding[7];
++	u64 fd_offset;
++	u64 shm_offset;
++	u64 len;
++	u64 flags;
++} __packed;
++
+ union vhost_user_payload {
+ 	u64 integer;
+ 	struct vhost_user_config config;
+ 	struct vhost_user_vring_state vring_state;
+ 	struct vhost_user_vring_addr vring_addr;
+ 	struct vhost_user_mem_regions mem_regions;
++	struct vhost_user_mmap mmap;
+ };
+ 
+ struct vhost_user_msg {
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 7425a8548..531ba7698 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -27,6 +27,7 @@
+ #include <linux/string_choices.h>
+ #include <linux/virtio.h>
+ #include <linux/virtio_config.h>
++#include <asm/shm_window.h>
+ #include <linux/virtio_ring.h>
+ #include <linux/time-internal.h>
+ #include <linux/virtio-uml.h>
+@@ -58,6 +59,11 @@ struct virtio_uml_device {
+ 	int sock, req_fd, irq;
+ 	u64 features;
+ 	u64 protocol_features;
++
++	/* virtio shared memory regions (VHOST_USER_PROTOCOL_F_SHMEM) */
++#define VU_MAX_SHM	8
++	unsigned int n_shm;
++	u64 shm_base[VU_MAX_SHM], shm_len[VU_MAX_SHM];
+ 	u64 max_vqs;
+ 	u8 status;
+ 	u8 registered:1;
+@@ -209,13 +215,29 @@ static int vhost_user_recv_u64(struct virtio_uml_device *vu_dev,
+ 
+ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+ 			       struct vhost_user_msg *msg,
+-			       size_t max_payload_size)
++			       size_t max_payload_size, int *fd)
+ {
+-	int rc = vhost_user_recv(vu_dev, vu_dev->req_fd, msg,
+-				 max_payload_size, false);
++	ssize_t n;
++	int rc;
+ 
+-	if (rc)
++	/* recvmsg for the header: a SHMEM_MAP request carries an fd */
++	*fd = -1;
++	n = os_rcv_fd_msg(vu_dev->req_fd, fd, 1, msg, sizeof(msg->header));
++	if (n < 0)
++		return n;
++	if (n == 0)
++		return -ECONNRESET;
++	rc = full_read(vu_dev->req_fd, (u8 *)msg + n, sizeof(msg->header) - n, false);
++	if (!rc && msg->header.size > max_payload_size)
++		rc = -EPROTO;
++	if (!rc)
++		rc = full_read(vu_dev->req_fd, &msg->payload, msg->header.size, false);
++	if (rc) {
++		if (*fd >= 0)
++			os_close_file(*fd);
++		*fd = -1;
+ 		return rc;
++	}
+ 
+ 	if ((msg->header.flags & ~VHOST_USER_FLAG_NEED_REPLY) !=
+ 			VHOST_USER_VERSION)
+@@ -386,15 +408,16 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 		struct vhost_user_msg msg;
+ 		u8 extra_payload[512];
+ 	} msg;
+-	int rc;
++	int rc, fd;
+ 	irqreturn_t irq_rc = IRQ_NONE;
+ 
+ 	while (1) {
+ 		rc = vhost_user_recv_req(vu_dev, &msg.msg,
+ 					 sizeof(msg.msg.payload) +
+-					 sizeof(msg.extra_payload));
++					 sizeof(msg.extra_payload), &fd);
+ 		if (rc)
+ 			break;
++		response = 1;
+ 
+ 		switch (msg.msg.header.request) {
+ 		case VHOST_USER_SLAVE_CONFIG_CHANGE_MSG:
+@@ -410,6 +433,30 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 				}
+ 			}
+ 			break;
++		case VHOST_USER_SLAVE_SHMEM_MAP:
++		case VHOST_USER_SLAVE_SHMEM_UNMAP: {
++			struct vhost_user_mmap *m = &msg.msg.payload.mmap;
++			bool map = msg.msg.header.request == VHOST_USER_SLAVE_SHMEM_MAP;
++
++			if (m->shmid >= vu_dev->n_shm || !m->len ||
++			    m->shm_offset + m->len > vu_dev->shm_len[m->shmid] ||
++			    m->shm_offset + m->len < m->len || (map && fd < 0)) {
++				vu_err(vu_dev, "invalid shmem request %d\n",
++				       msg.msg.header.request);
++				break;
++			}
++			if (map) {
++				response = um_shm_map(vu_dev->shm_base[m->shmid] + m->shm_offset,
++						      m->len, fd, m->fd_offset,
++						      m->flags & VHOST_USER_FLAG_MAP_RW) ? 1 : 0;
++				if (!response)
++					fd = -1;	/* taken over */
++			} else {
++				response = um_shm_unmap(vu_dev->shm_base[m->shmid] + m->shm_offset,
++							m->len) ? 1 : 0;
++			}
++			break;
++		}
+ 		case VHOST_USER_SLAVE_IOTLB_MSG:
+ 			/* not supported - VIRTIO_F_ACCESS_PLATFORM */
+ 		case VHOST_USER_SLAVE_VRING_HOST_NOTIFIER_MSG:
+@@ -422,6 +469,8 @@ static irqreturn_t vu_req_read_message(struct virtio_uml_device *vu_dev,
+ 		if (ev && !vu_dev->suspended)
+ 			time_travel_add_irq_event(ev);
+ 
++		if (fd >= 0)
++			os_close_file(fd);
+ 		if (msg.msg.header.flags & VHOST_USER_FLAG_NEED_REPLY)
+ 			vhost_user_reply(vu_dev, &msg.msg, response);
+ 		irq_rc = IRQ_HANDLED;
+@@ -499,6 +548,46 @@ static int vhost_user_init_slave_req(struct virtio_uml_device *vu_dev)
+ 	return rc;
+ }
+ 
++/* Sizes of the shared memory regions; reserve guest physical windows */
++static int vhost_user_get_shmem_config(struct virtio_uml_device *vu_dev)
++{
++	struct {
++		struct vhost_user_msg msg;
++		struct vhost_user_shmem_config cfg;
++	} *r;
++	struct vhost_user_shmem_config *cfg;
++	int rc;
++
++	rc = vhost_user_send_no_payload(vu_dev, true, VHOST_USER_GET_SHMEM_CONFIG);
++	if (rc)
++		return rc;
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++	rc = vhost_user_recv_resp(vu_dev, &r->msg, sizeof(r->msg.payload) + sizeof(r->cfg));
++	if (rc)
++		goto out;
++	rc = -EPROTO;
++	if (r->msg.header.request != VHOST_USER_GET_SHMEM_CONFIG ||
++	    r->msg.header.size < 8)
++		goto out;
++	cfg = (void *)&r->msg.payload;
++	vu_dev->n_shm = min_t(u32, cfg->nregions, VU_MAX_SHM);
++	for (unsigned int i = 0; i < vu_dev->n_shm; i++) {
++		u64 len = PAGE_ALIGN(cfg->memory_sizes[i]);
++
++		vu_dev->shm_len[i] = len;
++		vu_dev->shm_base[i] = len ? um_shm_reserve(len) : 0;
++		if (len)
++			dev_info(&vu_dev->pdev->dev, "shared memory region %u: %llu MiB at 0x%llx\n",
++				i, len >> 20, vu_dev->shm_base[i]);
++	}
++	rc = 0;
++out:
++	kfree(r);
++	return rc;
++}
++
+ static int vhost_user_init(struct virtio_uml_device *vu_dev)
+ {
+ 	int rc = vhost_user_set_owner(vu_dev);
+@@ -528,6 +617,13 @@ static int vhost_user_init(struct virtio_uml_device *vu_dev)
+ 			return rc;
+ 	}
+ 
++	if (vu_dev->protocol_features &
++			BIT_ULL(VHOST_USER_PROTOCOL_F_SHMEM)) {
++		rc = vhost_user_get_shmem_config(vu_dev);
++		if (rc)
++			return rc;
++	}
++
+ 	if (vu_dev->protocol_features &
+ 			BIT_ULL(VHOST_USER_PROTOCOL_F_MQ)) {
+ 		rc = vhost_user_get_queue_num(vu_dev, &vu_dev->max_vqs);
+@@ -1113,7 +1209,20 @@ static const char *vu_bus_name(struct virtio_device *vdev)
+ 	return vu_dev->pdev->name;
+ }
+ 
++static bool vu_get_shm_region(struct virtio_device *vdev,
++			      struct virtio_shm_region *region, u8 id)
++{
++	struct virtio_uml_device *vu_dev = to_virtio_uml_device(vdev);
++
++	if (id >= vu_dev->n_shm || !vu_dev->shm_len[id])
++		return false;
++	region->addr = vu_dev->shm_base[id];
++	region->len = vu_dev->shm_len[id];
++	return true;
++}
++
+ static const struct virtio_config_ops virtio_uml_config_ops = {
++	.get_shm_region = vu_get_shm_region,
+ 	.get = vu_get,
+ 	.set = vu_set,
+ 	.get_status = vu_get_status,
+diff --git a/arch/um/include/asm/shm_window.h b/arch/um/include/asm/shm_window.h
+new file mode 100644
+index 000000000..218542fa5
+--- /dev/null
++++ b/arch/um/include/asm/shm_window.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_SHM_WINDOW_H
++#define __UM_SHM_WINDOW_H
++
++#include <linux/types.h>
++
++/*
++ * Shared memory windows: guest physical ranges above RAM that map host files
++ * passed by vhost-user backends (virtio shared memory regions).
++ */
++#define UM_SHM_PHYS_BASE	(1UL << 40)
++
++unsigned long um_shm_reserve(unsigned long len);
++int um_shm_map(unsigned long phys, unsigned long len, int fd,
++	       unsigned long long fd_off, bool writable);
++int um_shm_unmap(unsigned long phys, unsigned long len);
++void *um_shm_kaddr(unsigned long phys);
++
++#endif
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index aeb069413..7882422d5 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -148,6 +148,9 @@ extern int os_mode_fd(int fd, int mode);
+ extern int os_seek_file(int fd, unsigned long long offset);
+ extern int os_open_file(const char *file, struct openflags flags, int mode);
+ extern void *os_map_shared_file(const char *path, unsigned long size);
++extern int um_physmem_fd(void);
++extern void *os_map_fd_shared(int fd, unsigned long long off, unsigned long len,
++			      int writable);
+ extern int os_read_file(int fd, void *buf, int len);
+ extern int os_write_file(int fd, const void *buf, int count);
+ extern int os_sync_file(int fd);
+diff --git a/arch/um/kernel/physmem.c b/arch/um/kernel/physmem.c
+index ae6ca373c..355eb62e5 100644
+--- a/arch/um/kernel/physmem.c
++++ b/arch/um/kernel/physmem.c
+@@ -7,6 +7,10 @@
+ #include <linux/memblock.h>
+ #include <linux/mm.h>
+ #include <linux/pfn.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <asm/shm_window.h>
+ #include <asm/page.h>
+ #include <asm/sections.h>
+ #include <as-layout.h>
+@@ -97,6 +101,132 @@ void __init setup_physmem(unsigned long start, unsigned long reserve_end,
+ 	max_low_pfn = min_low_pfn + (map_size >> PAGE_SHIFT);
+ }
+ 
++struct um_shm_map {
++	unsigned long phys, len;
++	int fd;
++	unsigned long long fd_off;
++	void *kaddr;
++};
++
++/* Sorted by phys; read on every TLB sync of such a page, changed rarely */
++static struct um_shm_map *shm_maps;
++static unsigned int shm_n, shm_cap;
++static DEFINE_RWLOCK(shm_lock);
++static unsigned long shm_next = UM_SHM_PHYS_BASE;
++static DEFINE_SPINLOCK(shm_reserve_lock);
++
++/* Reserve a window of guest physical addresses (1 GiB aligned) */
++unsigned long um_shm_reserve(unsigned long len)
++{
++	unsigned long base;
++
++	spin_lock(&shm_reserve_lock);
++	base = ALIGN(shm_next, SZ_1G);
++	shm_next = base + ALIGN(len, SZ_1G);
++	spin_unlock(&shm_reserve_lock);
++	return base;
++}
++
++/* The mapping containing @phys, or the index to insert one at; under shm_lock */
++static struct um_shm_map *shm_find(unsigned long phys, unsigned int *pos)
++{
++	unsigned int lo = 0, hi = shm_n;
++
++	while (lo < hi) {
++		unsigned int mid = (lo + hi) / 2;
++		struct um_shm_map *m = &shm_maps[mid];
++
++		if (phys < m->phys)
++			hi = mid;
++		else if (phys >= m->phys + m->len)
++			lo = mid + 1;
++		else
++			return m;
++	}
++	if (pos)
++		*pos = lo;
++	return NULL;
++}
++
++/* Map @len bytes of @fd at @fd_off at guest physical @phys; takes over @fd */
++int um_shm_map(unsigned long phys, unsigned long len, int fd,
++	       unsigned long long fd_off, bool writable)
++{
++	unsigned long flags;
++	unsigned int pos;
++	void *kaddr;
++	int err = 0;
++
++	if (phys < UM_SHM_PHYS_BASE || !len || (phys | len | fd_off) & ~PAGE_MASK)
++		return -EINVAL;
++	kaddr = os_map_fd_shared(fd, fd_off, len, writable);
++	if (!kaddr)
++		return -ENOMEM;
++
++	write_lock_irqsave(&shm_lock, flags);
++	if (shm_find(phys, &pos) || shm_find(phys + len - 1, NULL) ||
++	    (pos < shm_n && shm_maps[pos].phys < phys + len)) {
++		err = -EEXIST;
++		goto out;
++	}
++	if (shm_n == shm_cap) {
++		unsigned int cap = shm_cap ? 2 * shm_cap : 64;
++		struct um_shm_map *n = krealloc_array(shm_maps, cap, sizeof(*n), GFP_ATOMIC);
++
++		if (!n) {
++			err = -ENOMEM;
++			goto out;
++		}
++		shm_maps = n;
++		shm_cap = cap;
++	}
++	memmove(&shm_maps[pos + 1], &shm_maps[pos], (shm_n - pos) * sizeof(*shm_maps));
++	shm_maps[pos] = (struct um_shm_map){ phys, len, fd, fd_off, kaddr };
++	shm_n++;
++out:
++	write_unlock_irqrestore(&shm_lock, flags);
++	if (err)
++		os_unmap_memory(kaddr, len);
++	return err;
++}
++
++/* Undo um_shm_map(): the guest must not have the range mapped any more */
++int um_shm_unmap(unsigned long phys, unsigned long len)
++{
++	struct um_shm_map m, *p;
++	unsigned long flags;
++
++	write_lock_irqsave(&shm_lock, flags);
++	p = shm_find(phys, NULL);
++	if (!p || p->phys != phys || p->len != len) {
++		write_unlock_irqrestore(&shm_lock, flags);
++		return -ENOENT;
++	}
++	m = *p;
++	memmove(p, p + 1, (shm_n - (p - shm_maps) - 1) * sizeof(*p));
++	shm_n--;
++	write_unlock_irqrestore(&shm_lock, flags);
++
++	os_unmap_memory(m.kaddr, m.len);
++	os_close_file(m.fd);
++	return 0;
++}
++
++/* The kernel's mapping of a shared memory page, for user copies */
++void *um_shm_kaddr(unsigned long phys)
++{
++	struct um_shm_map *m;
++	unsigned long flags;
++	void *k = NULL;
++
++	read_lock_irqsave(&shm_lock, flags);
++	m = shm_find(phys, NULL);
++	if (m)
++		k = m->kaddr + (phys - m->phys);
++	read_unlock_irqrestore(&shm_lock, flags);
++	return k;
++}
++
+ int phys_mapping(unsigned long phys, unsigned long long *offset_out)
+ {
+ 	int fd = -1;
+@@ -104,10 +234,27 @@ int phys_mapping(unsigned long phys, unsigned long long *offset_out)
+ 	if (phys < physmem_size) {
+ 		fd = physmem_fd;
+ 		*offset_out = phys;
++	} else if (phys >= UM_SHM_PHYS_BASE) {
++		struct um_shm_map *m;
++		unsigned long flags;
++
++		read_lock_irqsave(&shm_lock, flags);
++		m = shm_find(phys, NULL);
++		if (m) {
++			fd = m->fd;
++			*offset_out = m->fd_off + (phys - m->phys);
++		}
++		read_unlock_irqrestore(&shm_lock, flags);
+ 	}
+ 
+ 	return fd;
+ }
++
++/* The RAM file: the only memory FD worth keeping open in stub processes */
++int um_physmem_fd(void)
++{
++	return physmem_fd;
++}
+ EXPORT_SYMBOL(phys_mapping);
+ 
+ static int __init uml_mem_setup(char *line, int *add)
+diff --git a/arch/um/kernel/skas/uaccess.c b/arch/um/kernel/skas/uaccess.c
+index caef1deef..f19dc2466 100644
+--- a/arch/um/kernel/skas/uaccess.c
++++ b/arch/um/kernel/skas/uaccess.c
+@@ -10,6 +10,7 @@
+ #include <linux/sched.h>
+ #include <asm/current.h>
+ #include <asm/page.h>
++#include <asm/shm_window.h>
+ #include <kern_util.h>
+ #include <asm/futex.h>
+ #include <os.h>
+@@ -72,6 +73,18 @@ static int do_op_one_page(unsigned long addr, int len, int is_write,
+ 	if (pte == NULL)
+ 		return -1;
+ 
++	/* Not RAM: a shared memory window (e.g. virtio-gpu host memory) */
++	if (!pfn_valid(pte_pfn(*pte))) {
++		void *k = um_shm_kaddr(pte_pfn(*pte) << PAGE_SHIFT);
++
++		if (!k)
++			return -1;
++		pagefault_disable();
++		n = (*op)((unsigned long)k + (addr & ~PAGE_MASK), len, arg);
++		pagefault_enable();
++		return n;
++	}
++
+ 	page = pte_page(*pte);
+ #ifdef CONFIG_64BIT
+ 	pagefault_disable();
+diff --git a/arch/um/os-Linux/file.c b/arch/um/os-Linux/file.c
+index b36311e88..ab6da9291 100644
+--- a/arch/um/os-Linux/file.c
++++ b/arch/um/os-Linux/file.c
+@@ -730,6 +730,15 @@ void *os_mremap_rw_shared(void *old_addr, size_t old_size, size_t new_size)
+  * process outside UML can see what the kernel writes there. Returns NULL
+  * on failure.
+  */
++/* Map @len bytes of @fd at @off shared into the kernel's address space */
++void *os_map_fd_shared(int fd, unsigned long long off, unsigned long len, int writable)
++{
++	void *p = mmap(NULL, len, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED,
++		       fd, off);
++
++	return p == MAP_FAILED ? NULL : p;
++}
++
+ void *os_map_shared_file(const char *path, unsigned long size)
+ {
+ 	void *p;
+diff --git a/arch/um/os-Linux/skas/mem.c b/arch/um/os-Linux/skas/mem.c
+index e0ff2d746..e0a0e76eb 100644
+--- a/arch/um/os-Linux/skas/mem.c
++++ b/arch/um/os-Linux/skas/mem.c
+@@ -290,8 +290,12 @@ unsigned int syscall_stub_fd_keep(struct mm_id *mm_idp)
+ 			free++;
+ 
+ 	for (i = 0; i < mm_idp->syscall_fd_num && free; i++) {
+-		/* Not the FDs passed for other purposes, e.g. sockets */
+-		if (mm_idp->syscall_fd_map[i] < 0)
++		/*
++		 * Only the RAM file: other memory FDs (shared memory windows)
++		 * are closed and their numbers reused, a cached one would map
++		 * the wrong file.
++		 */
++		if (mm_idp->syscall_fd_map[i] != um_physmem_fd())
+ 			continue;
+ 		keep |= 1U << i;
+ 		free--;
+-- 
+2.43.0
+

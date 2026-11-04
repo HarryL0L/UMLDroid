@@ -1,0 +1,232 @@
+From 275cdb4e91ef88df0283740cd24a7655d0bc0ebd Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Mon, 2 Nov 2026 04:18:50 +0000
+Subject: [PATCH 10/12] um: add a touchscreen fed from a host file
+
+umltouch=<host path>,<width>x<height> creates a direct (on-screen)
+multitouch device plus the usual navigation keys, and reads fixed-size
+records (touch up, touch at x/y, key code and state) from a host file
+descriptor, typically a FIFO. A program on the host can then drive the
+guest's UI.
+---
+ arch/um/drivers/Kconfig     |   9 ++
+ arch/um/drivers/Makefile    |   1 +
+ arch/um/drivers/uml_touch.c | 177 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 187 insertions(+)
+ create mode 100644 arch/um/drivers/uml_touch.c
+
+diff --git a/arch/um/drivers/Kconfig b/arch/um/drivers/Kconfig
+index 6a0354ca0..f7709e0fc 100644
+--- a/arch/um/drivers/Kconfig
++++ b/arch/um/drivers/Kconfig
+@@ -188,3 +188,12 @@ config UML_PCI_OVER_VFIO
+ 	  This driver provides support for VFIO-based PCI passthrough.
+ 	  Currently, only MSI-X capable devices are supported, and it
+ 	  is assumed that drivers will use MSI-X.
++
++config UML_TOUCH
++	bool "Touchscreen fed from the host"
++	depends on INPUT
++	help
++	  A touchscreen and navigation buttons whose events are read from a
++	  host file (umltouch=<path>,<width>x<height>), so a program on the
++	  host can drive the guest's UI.
++
+diff --git a/arch/um/drivers/Makefile b/arch/um/drivers/Makefile
+index 36dc57840..91ad53012 100644
+--- a/arch/um/drivers/Makefile
++++ b/arch/um/drivers/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_UML_WATCHDOG) += harddog.o
+ obj-y += $(harddog-builtin-y) $(harddog-builtin-m)
+ obj-$(CONFIG_BLK_DEV_COW_COMMON) += cow_user.o
+ obj-$(CONFIG_UML_RANDOM) += random.o
++obj-$(CONFIG_UML_TOUCH) += uml_touch.o
+ obj-$(CONFIG_VIRTIO_UML) += virtio_uml.o
+ obj-$(CONFIG_UML_RTC) += rtc.o
+ obj-$(CONFIG_UML_PCI) += virt-pci.o
+diff --git a/arch/um/drivers/uml_touch.c b/arch/um/drivers/uml_touch.c
+new file mode 100644
+index 000000000..050361adc
+--- /dev/null
++++ b/arch/um/drivers/uml_touch.c
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Touchscreen and buttons fed from a host file descriptor.
++ *
++ *   umltouch=<host path>,<width>x<height>
++ *
++ * opens <host path> (typically a FIFO; it is opened read-write so that the
++ * kernel never sees end-of-file when a writer goes away) and reads fixed-size
++ * little-endian records from it:
++ *
++ *   struct { u32 type; s32 a; s32 b; }
++ *
++ *   type 0: touch up
++ *   type 1: touch down or move to (a, b), in display pixels
++ *   type 2: key event, a = Linux key code, b = 1 (press) or 0 (release)
++ *
++ * The device is a direct (on-screen) single-touch multitouch device sized to
++ * the display, so Android treats it as the touchscreen of the internal
++ * display, and it reports the usual navigation keys.
++ */
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <irq_kern.h>
++#include <os.h>
++
++struct uml_touch_event {
++	__le32 type;
++	__le32 a;
++	__le32 b;
++};
++
++static char touch_path[256];
++static unsigned int touch_width = 720, touch_height = 1280;
++static int touch_fd = -1;
++static struct input_dev *touch_input;
++static u8 touch_buf[sizeof(struct uml_touch_event)];
++static size_t touch_buffered;
++static bool touch_down;
++
++static const unsigned int touch_keys[] = {
++	KEY_BACK, KEY_HOMEPAGE, KEY_APPSELECT, KEY_POWER,
++	KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MENU,
++};
++
++static void uml_touch_handle(const struct uml_touch_event *ev)
++{
++	u32 type = le32_to_cpu(ev->type);
++	s32 a = le32_to_cpu(ev->a), b = le32_to_cpu(ev->b);
++
++	switch (type) {
++	case 0:
++		if (!touch_down)
++			return;
++		touch_down = false;
++		input_mt_slot(touch_input, 0);
++		input_mt_report_slot_inactive(touch_input);
++		break;
++	case 1:
++		a = clamp_t(s32, a, 0, touch_width - 1);
++		b = clamp_t(s32, b, 0, touch_height - 1);
++		touch_down = true;
++		input_mt_slot(touch_input, 0);
++		input_mt_report_slot_state(touch_input, MT_TOOL_FINGER, true);
++		input_report_abs(touch_input, ABS_MT_POSITION_X, a);
++		input_report_abs(touch_input, ABS_MT_POSITION_Y, b);
++		break;
++	case 2:
++		if (a <= 0 || a >= KEY_CNT || !test_bit(a, touch_input->keybit))
++			return;
++		input_report_key(touch_input, a, !!b);
++		input_sync(touch_input);
++		return;
++	default:
++		return;
++	}
++	input_mt_sync_frame(touch_input);
++	input_sync(touch_input);
++}
++
++static irqreturn_t uml_touch_interrupt(int irq, void *data)
++{
++	for (;;) {
++		int n = os_read_file(touch_fd, touch_buf + touch_buffered,
++				     sizeof(touch_buf) - touch_buffered);
++
++		if (n <= 0)
++			break;
++		touch_buffered += n;
++		if (touch_buffered == sizeof(touch_buf)) {
++			uml_touch_handle((const struct uml_touch_event *)touch_buf);
++			touch_buffered = 0;
++		}
++	}
++	return IRQ_HANDLED;
++}
++
++static int __init uml_touch_setup(char *str)
++{
++	char *size = strchr(str, ',');
++
++	if (size) {
++		*size++ = '\0';
++		if (sscanf(size, "%ux%u", &touch_width, &touch_height) != 2 ||
++		    !touch_width || !touch_height) {
++			pr_err("umltouch: bad size '%s', want <width>x<height>\n", size);
++			return 1;
++		}
++	}
++	strscpy(touch_path, str, sizeof(touch_path));
++	return 1;
++}
++__setup("umltouch=", uml_touch_setup);
++
++static int __init uml_touch_init(void)
++{
++	int err;
++
++	if (!touch_path[0])
++		return 0;
++
++	touch_fd = os_open_file(touch_path, of_rdwr(OPENFLAGS()), 0);
++	if (touch_fd < 0) {
++		pr_err("umltouch: cannot open %s: %d\n", touch_path, touch_fd);
++		return touch_fd;
++	}
++	os_set_fd_block(touch_fd, 0);
++
++	touch_input = input_allocate_device();
++	if (!touch_input) {
++		err = -ENOMEM;
++		goto close;
++	}
++	touch_input->name = "UML touchscreen";
++	touch_input->phys = "uml/touch0";
++	touch_input->id.bustype = BUS_VIRTUAL;
++	touch_input->id.vendor = 0x554d;	/* "UM" */
++	touch_input->id.product = 0x0001;
++
++	input_set_abs_params(touch_input, ABS_MT_POSITION_X, 0, touch_width - 1, 0, 0);
++	input_set_abs_params(touch_input, ABS_MT_POSITION_Y, 0, touch_height - 1, 0, 0);
++	err = input_mt_init_slots(touch_input, 1, INPUT_MT_DIRECT);
++	if (err)
++		goto free;
++	for (size_t i = 0; i < ARRAY_SIZE(touch_keys); i++)
++		input_set_capability(touch_input, EV_KEY, touch_keys[i]);
++
++	err = input_register_device(touch_input);
++	if (err)
++		goto free;
++
++	err = um_request_irq(UM_IRQ_ALLOC, touch_fd, IRQ_READ, uml_touch_interrupt,
++			     0, "umltouch", NULL);
++	if (err < 0)
++		goto unregister;
++
++	pr_info("umltouch: %ux%u touchscreen fed from %s\n",
++		touch_width, touch_height, touch_path);
++	return 0;
++
++unregister:
++	input_unregister_device(touch_input);
++	touch_input = NULL;
++	goto close;
++free:
++	input_free_device(touch_input);
++	touch_input = NULL;
++close:
++	os_close_file(touch_fd);
++	touch_fd = -1;
++	return err;
++}
++late_initcall(uml_touch_init);
+-- 
+2.43.0
+

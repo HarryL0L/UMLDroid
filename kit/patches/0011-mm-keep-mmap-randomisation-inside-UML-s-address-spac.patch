@@ -1,0 +1,42 @@
+From 26199f24e0436b9bcb8203d5473d2e4487fc82d6 Mon Sep 17 00:00:00 2001
+From: user <temp9040@gmail.com>
+Date: Mon, 2 Nov 2026 10:14:35 +0000
+Subject: [PATCH 11/12] mm: keep mmap randomisation inside UML's address space
+
+UML's task size is whatever the host leaves it: a few hundred GB on arm64
+hosts with 39-bit virtual addresses. Android sets mmap_rnd_bits to 32 or
+more, which would push the mmap base below zero there. On UML, limit the
+random offset to an eighth of the task size.
+---
+ mm/util.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/mm/util.c b/mm/util.c
+index bf0513d1d..96bf90372 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -407,6 +407,21 @@ unsigned long arch_mmap_rnd(void)
+ #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
+ 		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+ 
++#ifdef CONFIG_UML
++	/*
++	 * UML's address space is whatever the host leaves it (a few hundred
++	 * GB on hosts with 39-bit virtual addresses), while Android sets
++	 * mmap_rnd_bits to 32 or more. Keep the offset within an eighth of
++	 * the task size so the mmap base stays inside the address space.
++	 */
++	{
++		unsigned long pages = rounddown_pow_of_two(TASK_SIZE / 8) >> PAGE_SHIFT;
++
++		if (pages)
++			rnd &= pages - 1;
++	}
++#endif
++
+ 	return rnd << PAGE_SHIFT;
+ }
+ 
+-- 
+2.43.0
+

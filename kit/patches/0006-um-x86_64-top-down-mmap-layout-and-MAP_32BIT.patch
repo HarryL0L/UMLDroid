@@ -1,0 +1,110 @@
+From a0657e881a9d13aa7e31b023bd04168a60576020 Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Sun, 1 Nov 2026 22:39:31 +0000
+Subject: [PATCH 06/12] um: x86_64: top-down mmap layout and MAP_32BIT
+
+The Android runtime (ART) allocates its heap with MAP_32BIT on x86-64 and
+aborts when the mapping lands above 4 GB, and expects the regular
+top-down layout for everything else. Use the generic top-down layout and
+place MAP_32BIT mappings bottom-up in the low 4 GB like native x86-64.
+Arm64 hosts need only the layout change; ART uses its own low-4GB
+allocator there.
+---
+ arch/um/Kconfig               |  1 +
+ arch/um/include/asm/pgtable.h |  6 +++++
+ arch/x86/um/mem_64.c          | 47 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/arch/um/Kconfig b/arch/um/Kconfig
+index d2027201d..a18940a73 100644
+--- a/arch/um/Kconfig
++++ b/arch/um/Kconfig
+@@ -22,6 +22,7 @@ config UML
+ 	select HAVE_ARCH_KASAN if X86_64
+ 	select HAVE_ARCH_KASAN_VMALLOC if HAVE_ARCH_KASAN
+ 	select HAVE_ARCH_SECCOMP_FILTER
++	select ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
+ 	select HAVE_ARCH_MMAP_RND_BITS
+ 	select HAVE_EBPF_JIT if 64BIT
+ 	select HAVE_ASM_MODVERSIONS
+diff --git a/arch/um/include/asm/pgtable.h b/arch/um/include/asm/pgtable.h
+index 65294b107..b406308ad 100644
+--- a/arch/um/include/asm/pgtable.h
++++ b/arch/um/include/asm/pgtable.h
+@@ -52,6 +52,12 @@ extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
+ #define MODULES_VADDR	VMALLOC_START
+ #define MODULES_END	VMALLOC_END
+ 
++#if defined(CONFIG_UML_X86) && defined(CONFIG_64BIT)
++/* arch/x86/um/mem_64.c: MAP_32BIT support */
++#define HAVE_ARCH_UNMAPPED_AREA
++#define HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
++#endif
++
+ #define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY)
+ #define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | _PAGE_DIRTY)
+ #define _PAGE_CHG_MASK	(PAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
+diff --git a/arch/x86/um/mem_64.c b/arch/x86/um/mem_64.c
+index c027e93d1..4729068b5 100644
+--- a/arch/x86/um/mem_64.c
++++ b/arch/x86/um/mem_64.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/sched/mm.h>
+ #include <asm/elf.h>
+ 
+ const char *arch_vma_name(struct vm_area_struct *vma)
+@@ -9,3 +11,48 @@ const char *arch_vma_name(struct vm_area_struct *vma)
+ 
+ 	return NULL;
+ }
++
++/*
++ * MAP_32BIT: 64-bit programs built for x86-64 (Android's ART runtime among
++ * them) rely on it to get mappings below 4 GB. The generic allocators ignore
++ * the flag, so place such mappings bottom-up in the low 4 GB like native
++ * x86-64 does, and fall back to the usual placement if that fails.
++ */
++static unsigned long map_32bit_area(unsigned long len, unsigned long pgoff,
++				    unsigned long flags)
++{
++	struct vm_unmapped_area_info info = {
++		.length		= len,
++		.low_limit	= 0x40000000UL,
++		.high_limit	= 0x100000000UL,
++		.align_offset	= pgoff << PAGE_SHIFT,
++	};
++
++	if (!(flags & MAP_32BIT) || (flags & MAP_FIXED))
++		return -ENOMEM;
++	return vm_unmapped_area(&info);
++}
++
++unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
++				     unsigned long len, unsigned long pgoff,
++				     unsigned long flags, vm_flags_t vm_flags)
++{
++	unsigned long ret = map_32bit_area(len, pgoff, flags);
++
++	if (!IS_ERR_VALUE(ret))
++		return ret;
++	return generic_get_unmapped_area(filp, addr, len, pgoff, flags,
++					 legacy_to_vma_flags(vm_flags));
++}
++
++unsigned long arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
++					     unsigned long len, unsigned long pgoff,
++					     unsigned long flags, vm_flags_t vm_flags)
++{
++	unsigned long ret = map_32bit_area(len, pgoff, flags);
++
++	if (!IS_ERR_VALUE(ret))
++		return ret;
++	return generic_get_unmapped_area_topdown(filp, addr, len, pgoff, flags,
++						 legacy_to_vma_flags(vm_flags));
++}
+-- 
+2.43.0
+

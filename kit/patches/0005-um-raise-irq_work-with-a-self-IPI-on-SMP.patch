@@ -1,0 +1,104 @@
+From df857d47fa65a01680924256576095c3f624976f Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Sun, 1 Nov 2026 22:39:31 +0000
+Subject: [PATCH 05/12] um: raise irq_work with a self-IPI on SMP
+
+Without arch_irq_work_raise() queued irq_work only ran on the next timer
+tick. The BPF memory allocator refills its per-CPU caches from irq_work,
+so a burst of map updates (system_server registering its permission map)
+ran the cache dry and failed with ENOMEM. Send an IPI to the current CPU
+instead; UML defers it until interrupts are enabled again.
+---
+ arch/um/include/asm/Kbuild     |  1 -
+ arch/um/include/asm/irq_work.h | 11 +++++++++++
+ arch/um/kernel/smp.c           | 21 +++++++++++++++++++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+ create mode 100644 arch/um/include/asm/irq_work.h
+
+diff --git a/arch/um/include/asm/Kbuild b/arch/um/include/asm/Kbuild
+index 8fdc0bd9a..d2f4bec6d 100644
+--- a/arch/um/include/asm/Kbuild
++++ b/arch/um/include/asm/Kbuild
+@@ -8,7 +8,6 @@ generic-y += exec.h
+ generic-y += ftrace.h
+ generic-y += hw_irq.h
+ generic-y += irq_regs.h
+-generic-y += irq_work.h
+ generic-y += kdebug.h
+ generic-y += mcs_spinlock.h
+ generic-y += mmiowb.h
+diff --git a/arch/um/include/asm/irq_work.h b/arch/um/include/asm/irq_work.h
+new file mode 100644
+index 000000000..104ba1c88
+--- /dev/null
++++ b/arch/um/include/asm/irq_work.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_UM_IRQ_WORK_H
++#define __ASM_UM_IRQ_WORK_H
++
++/* With SMP, irq_work is raised with a self-IPI (arch/um/kernel/smp.c). */
++static inline bool arch_irq_work_has_interrupt(void)
++{
++	return IS_ENABLED(CONFIG_SMP);
++}
++
++#endif /* __ASM_UM_IRQ_WORK_H */
+diff --git a/arch/um/kernel/smp.c b/arch/um/kernel/smp.c
+index bd0c8b4a3..17bce3453 100644
+--- a/arch/um/kernel/smp.c
++++ b/arch/um/kernel/smp.c
+@@ -17,6 +17,7 @@
+ #include <linux/hardirq.h>
+ #include <linux/smp.h>
+ #include <linux/smp-internal.h>
++#include <linux/irq_work.h>
+ #include <init.h>
+ #include <kern.h>
+ #include <os.h>
+@@ -28,8 +29,23 @@ enum {
+ 	UML_IPI_CALL_SINGLE,
+ 	UML_IPI_CALL,
+ 	UML_IPI_STOP,
++	UML_IPI_IRQ_WORK,
+ };
+ 
++/* Set once the IPI signal handler and this CPU's thread id are in place. */
++static bool uml_ipi_ready __read_mostly;
++
++/*
++ * irq_work: raise a self-IPI. It is delivered as soon as interrupts are
++ * enabled again, so work queued with interrupts off (BPF's allocator refill,
++ * for example) runs right away instead of waiting for the next tick.
++ */
++void arch_irq_work_raise(void)
++{
++	if (READ_ONCE(uml_ipi_ready))
++		os_send_ipi(raw_smp_processor_id(), UML_IPI_IRQ_WORK);
++}
++
+ void arch_smp_send_reschedule(int cpu)
+ {
+ 	os_send_ipi(cpu, UML_IPI_RES);
+@@ -85,6 +101,10 @@ static void ipi_handler(int vector, struct uml_pt_regs *regs)
+ 		generic_smp_call_function_interrupt();
+ 		break;
+ 
++	case UML_IPI_IRQ_WORK:
++		irq_work_run();
++		break;
++
+ 	case UML_IPI_STOP:
+ 		set_cpu_online(cpu, false);
+ 		while (1)
+@@ -169,6 +189,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ 	unsigned long deadline;
+ 
+ 	os_init_smp();
++	WRITE_ONCE(uml_ipi_ready, true);
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		if (cpu == me)
+-- 
+2.43.0
+

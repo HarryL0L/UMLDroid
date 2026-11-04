@@ -1,0 +1,58 @@
+From 540e21db1091dafcdbafcc19309b6a5fcfc598cf Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Sun, 1 Nov 2026 22:39:31 +0000
+Subject: [PATCH 04/12] mm/slub: let kmalloc_nolock() fall back to the regular
+ path on UML
+
+Without HAVE_CMPXCHG_DOUBLE kmalloc_nolock() can never allocate, so every
+BPF local storage allocation (bpf_sk_storage_get and friends) failed with
+ENOMEM, which broke netd's getsockopt self-test. UML has no NMIs and
+always runs the allocator in a context where the regular slow path is
+safe, so use it unless in NMI context.
+---
+ mm/slub.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 544cff397..06eb04208 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -5469,7 +5469,7 @@ static void *__kmalloc_nolock_noprof(DECL_TOKEN_PARAMS(size, token), gfp_t gfp_f
+ 	s = kmalloc_slab(size, NULL, gfp_flags, PASS_TOKEN_PARAM(token),
+ 			 ac->alloc_flags);
+ 
+-	if (!(s->flags & __CMPXCHG_DOUBLE) && !kmem_cache_debug(s))
++	if (!(s->flags & __CMPXCHG_DOUBLE) && !kmem_cache_debug(s)) {
+ 		/*
+ 		 * kmalloc_nolock() is not supported on architectures that
+ 		 * don't implement cmpxchg16b and thus need slab_lock()
+@@ -5478,8 +5478,26 @@ static void *__kmalloc_nolock_noprof(DECL_TOKEN_PARAMS(size, token), gfp_t gfp_f
+ 		 * kmem_cache_node->list_lock, so kmalloc_nolock() can attempt
+ 		 * to allocate from debug caches by
+ 		 * spin_trylock_irqsave(&n->list_lock, ...)
++		 *
++		 * User-Mode Linux is such an architecture, but it also has no
++		 * NMIs and its "interrupts" are signals handled outside the
++		 * allocator, so a regular non-sleeping allocation is safe
++		 * there. Without this, BPF local storage (bpf_sk_storage and
++		 * friends) can never allocate on UML.
+ 		 */
++		if (IS_ENABLED(CONFIG_UML) && !in_nmi()) {
++			const struct slab_alloc_context fac = {
++				.caller_addr = _RET_IP_,
++				.orig_size = size,
++				.alloc_flags = SLAB_ALLOC_DEFAULT,
++			};
++
++			return __do_kmalloc_node(PASS_BUCKET_PARAM(NULL),
++						 gfp_flags | GFP_NOWAIT, node,
++						 PASS_TOKEN_PARAM(token), &fac);
++		}
+ 		return NULL;
++	}
+ 
+ 	ret = alloc_from_pcs(s, gfp_flags, ac->alloc_flags, node);
+ 	if (ret)
+-- 
+2.43.0
+

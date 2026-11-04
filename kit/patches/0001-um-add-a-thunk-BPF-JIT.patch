@@ -1,0 +1,278 @@
+From 6947eddbceeb3378eda75e653571fbd5f0c7a610 Mon Sep 17 00:00:00 2001
+From: UML Android bring-up <uml@example.invalid>
+Date: Sun, 1 Nov 2026 22:39:31 +0000
+Subject: [PATCH 01/12] um: add a thunk BPF "JIT"
+
+Android's BPF loaders need a kernel with a BPF JIT: netd writes
+bpf_jit_enable, and the verifier only accepts programs with callbacks or
+bpf-to-bpf calls when they can be JITed. UML has no JIT, so emit, for every
+program, a short native stub that jumps into the interpreter entry taking
+the instruction array as its sixth argument. The stubs are placed in a page
+arena inside the kernel image, within the 32-bit reach of __bpf_call_base,
+and the arena is made executable through the host.
+
+x86_64 and arm64 host encodings are provided.
+---
+ arch/um/Kconfig                |   1 +
+ arch/um/kernel/Makefile        |   1 +
+ arch/um/kernel/bpf_jit_thunk.c | 182 +++++++++++++++++++++++++++++++++
+ include/linux/filter.h         |   1 +
+ kernel/bpf/core.c              |  17 +++
+ 5 files changed, 202 insertions(+)
+ create mode 100644 arch/um/kernel/bpf_jit_thunk.c
+
+diff --git a/arch/um/Kconfig b/arch/um/Kconfig
+index 07d80cbae..d8e7c1dfe 100644
+--- a/arch/um/Kconfig
++++ b/arch/um/Kconfig
+@@ -22,6 +22,7 @@ config UML
+ 	select HAVE_ARCH_KASAN if X86_64
+ 	select HAVE_ARCH_KASAN_VMALLOC if HAVE_ARCH_KASAN
+ 	select HAVE_ARCH_SECCOMP_FILTER
++	select HAVE_EBPF_JIT if 64BIT
+ 	select HAVE_ASM_MODVERSIONS
+ 	select HAVE_UID16
+ 	select HAVE_DEBUG_KMEMLEAK
+diff --git a/arch/um/kernel/Makefile b/arch/um/kernel/Makefile
+index bb92e2749..3dccacf53 100644
+--- a/arch/um/kernel/Makefile
++++ b/arch/um/kernel/Makefile
+@@ -27,6 +27,7 @@ obj-$(CONFIG_OF) += dtb.o
+ obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
+ obj-$(CONFIG_STACKTRACE) += stacktrace.o
+ obj-$(CONFIG_SMP) += smp.o
++obj-$(CONFIG_BPF_JIT) += bpf_jit_thunk.o
+ 
+ USER_OBJS := config.o
+ 
+diff --git a/arch/um/kernel/bpf_jit_thunk.c b/arch/um/kernel/bpf_jit_thunk.c
+new file mode 100644
+index 000000000..cefaaf50c
+--- /dev/null
++++ b/arch/um/kernel/bpf_jit_thunk.c
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * "Thunk" eBPF JIT for User-Mode Linux.
++ *
++ * UML has no native JIT; the BPF interpreter runs every program. Some BPF
++ * features, however, need a program to be callable as a plain C function:
++ * helper callbacks (bpf_loop, bpf_for_each_map_elem, timers, ...) and the
++ * subprogram calls the verifier emits for JITed programs. The verifier
++ * refuses such programs when no JIT is present.
++ *
++ * This JIT satisfies that requirement without compiling anything: for every
++ * program it emits a few bytes of native code that jump into the interpreter
++ * entry taking the program's instructions as an extra argument. The kernel
++ * then treats the program as JITed while the interpreter does all the work.
++ */
++#include <linux/bpf.h>
++#include <linux/filter.h>
++#include <linux/string.h>
++#include <linux/bitmap.h>
++#include <linux/spinlock.h>
++#include <os.h>
++
++#if defined(CONFIG_UML_X86) && defined(CONFIG_64BIT)
++/*
++ *   movabs $insns, %r9      49 B9 imm64   (6th argument register)
++ *   movabs $entry, %rax     48 B8 imm64
++ *   jmp    *%rax            FF E0
++ */
++#define THUNK_LEN	22
++
++static void emit_thunk(u8 *img, const void *insns, const void *entry)
++{
++	img[0] = 0x49; img[1] = 0xB9; memcpy(img + 2, &insns, 8);
++	img[10] = 0x48; img[11] = 0xB8; memcpy(img + 12, &entry, 8);
++	img[20] = 0xFF; img[21] = 0xE0;
++}
++
++static void fill_ill_insns(void *area, unsigned int size)
++{
++	memset(area, 0xcc, size);		/* int3 */
++}
++
++static void sync_icache(void *start, unsigned long len)
++{
++}
++
++#elif defined(CONFIG_UML_ARM64)
++/*
++ *   0: ldr  x5, 0x10        58000085    (6th argument register)
++ *   4: ldr  x16, 0x18       580000b0
++ *   8: br   x16             d61f0200
++ *   c: brk  #0              d4200000
++ *  10: .quad insns
++ *  18: .quad entry
++ */
++#define THUNK_LEN	32
++
++static void emit_thunk(u8 *img, const void *insns, const void *entry)
++{
++	u32 *i = (u32 *)img;
++
++	i[0] = 0x58000085;
++	i[1] = 0x580000b0;
++	i[2] = 0xd61f0200;
++	i[3] = 0xd4200000;
++	memcpy(img + 16, &insns, 8);
++	memcpy(img + 24, &entry, 8);
++}
++
++static void fill_ill_insns(void *area, unsigned int size)
++{
++	u32 *p = area;
++	unsigned int i;
++
++	for (i = 0; i < size / 4; i++)
++		p[i] = 0xd4200000;		/* brk #0 */
++}
++
++static void sync_icache(void *start, unsigned long len)
++{
++	unsigned long addr = (unsigned long)start, end = addr + len;
++
++	for (; addr < end; addr += 64)
++		asm volatile("dc cvau, %0" : : "r"(addr) : "memory");
++	asm volatile("dsb ish" ::: "memory");
++	for (addr = (unsigned long)start; addr < end; addr += 64)
++		asm volatile("ic ivau, %0" : : "r"(addr) : "memory");
++	asm volatile("dsb ish\n\tisb" ::: "memory");
++}
++#else
++#error "no thunk encoding for this UML host architecture"
++#endif
++
++/*
++ * The interpreter reaches a JITed subprogram through a 32-bit offset from
++ * __bpf_call_base (the kernel text), so thunks must live within 2 GB of
++ * it. UML's vmalloc area starts above the physical memory and is usually
++ * out of range, so thunks come from a page arena inside the kernel image
++ * instead, which the host is asked to make executable. Each thunk takes a
++ * page laid out like a bpf_binary_header so the generic ksym code works.
++ */
++#define THUNK_ARENA_PAGES	2048	/* 8 MB: one page per loaded program */
++
++static u8 thunk_arena[THUNK_ARENA_PAGES * PAGE_SIZE] __aligned(PAGE_SIZE);
++static DECLARE_BITMAP(thunk_used, THUNK_ARENA_PAGES);
++static DEFINE_SPINLOCK(thunk_lock);
++static bool thunk_arena_exec;
++
++static struct bpf_binary_header *thunk_page_alloc(u8 **image)
++{
++	struct bpf_binary_header *hdr;
++	unsigned long n;
++
++	spin_lock(&thunk_lock);
++	if (!thunk_arena_exec) {
++		if (os_protect_memory(thunk_arena, sizeof(thunk_arena), 1, 1, 1)) {
++			spin_unlock(&thunk_lock);
++			pr_warn_once("bpf thunk arena cannot be made executable\n");
++			return NULL;
++		}
++		thunk_arena_exec = true;
++	}
++	n = find_first_zero_bit(thunk_used, THUNK_ARENA_PAGES);
++	if (n >= THUNK_ARENA_PAGES) {
++		spin_unlock(&thunk_lock);
++		pr_warn_once("bpf thunk arena exhausted\n");
++		return NULL;
++	}
++	set_bit(n, thunk_used);
++	spin_unlock(&thunk_lock);
++
++	hdr = (void *)(thunk_arena + n * PAGE_SIZE);
++	fill_ill_insns(hdr, PAGE_SIZE);
++	hdr->size = PAGE_SIZE;
++	*image = hdr->image;
++	return hdr;
++}
++
++static void thunk_page_free(struct bpf_binary_header *hdr)
++{
++	unsigned long n = ((unsigned long)hdr - (unsigned long)thunk_arena) / PAGE_SIZE;
++
++	if (WARN_ON_ONCE(n >= THUNK_ARENA_PAGES))
++		return;
++	spin_lock(&thunk_lock);
++	clear_bit(n, thunk_used);
++	spin_unlock(&thunk_lock);
++}
++
++void bpf_jit_free(struct bpf_prog *fp)
++{
++	if (fp->jited)
++		thunk_page_free((void *)((unsigned long)fp->bpf_func & PAGE_MASK));
++	bpf_prog_unlock_free(fp);
++}
++
++struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env,
++				     struct bpf_prog *prog)
++{
++	struct bpf_binary_header *hdr;
++	const void *entry;
++	u8 *image;
++
++	if (!prog->jit_requested || prog->jited)
++		return prog;
++
++	entry = bpf_interp_args_entry(prog->aux->stack_depth);
++	if (!entry)
++		return prog;
++
++	hdr = thunk_page_alloc(&image);
++	if (!hdr)
++		return prog;
++
++	emit_thunk(image, prog->insnsi, entry);
++	sync_icache(image, THUNK_LEN);
++
++	prog->bpf_func = (void *)image;
++	prog->jited = 1;
++	prog->jited_len = THUNK_LEN;
++	return prog;
++}
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 39decde7f..c5fbde0be 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1231,6 +1231,7 @@ void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
+ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ 
+ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_prog *prog);
++void *bpf_interp_args_entry(u32 stack_depth);
+ void bpf_jit_compile(struct bpf_prog *prog);
+ bool bpf_jit_needs_zext(void);
+ bool bpf_jit_inlines_helper_call(s32 imm);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 7f11555a5..e67e031b0 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2490,6 +2490,23 @@ int bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth)
+ 	return 0;
+ }
+ 
++/*
++ * Interpreter entry for a program with the given stack depth, callable as
++ * (r1, r2, r3, r4, r5, insns). Used by the User-Mode Linux thunk JIT.
++ */
++void *bpf_interp_args_entry(u32 stack_depth)
++{
++	int idx;
++
++	stack_depth = max_t(u32, stack_depth, 1);
++	if (stack_depth > MAX_BPF_STACK)
++		return NULL;
++	idx = (round_up(stack_depth, 32) / 32) - 1;
++	if (idx < 0 || idx >= ARRAY_SIZE(interpreters_args))
++		return NULL;
++	return (void *)interpreters_args[idx];
++}
++
+ s32 bpf_call_args_imm(s16 idx)
+ {
+ 	if (WARN_ON_ONCE(idx < 0 || idx >= ARRAY_SIZE(interpreters_args)))
+-- 
+2.43.0
+
