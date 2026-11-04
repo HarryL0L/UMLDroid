@@ -43,7 +43,7 @@ fi
 CROSS=()
 [ -n "${MESON_CROSS:-}" ] && CROSS=(--cross-file "$MESON_CROSS")
 [ -d build ] || meson setup build "${CROSS[@]}" -Ddefault_library=shared \
-  -Dgfxstream-build=host -Ddecoders=${DECODERS:-auto} -Dbuildtype=release \
+  -Dgfxstream-build=host -Ddecoders=${DECODERS:-vulkan,composer} -Dbuildtype=release \
   -Dlog-level=warn "$@"
 ninja -C build
 find "$PWD/build" -name 'libgfxstream_backend.so*' | head -3

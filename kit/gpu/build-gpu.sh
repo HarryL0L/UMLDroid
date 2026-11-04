@@ -45,7 +45,7 @@ PY
 
 # Vulkan decoder (Android's guest GLES is ANGLE on Vulkan) and the composer
 [ -d build ] || meson setup build -Ddefault_library=shared -Dgfxstream-build=host \
-  -Ddecoders=auto -Dbuildtype=release -Dlog-level=warn
+  -Ddecoders=vulkan,composer -Dbuildtype=release -Dlog-level=warn
 ninja -C build
 
 LIB=$(dirname "$(find build -name 'libgfxstream_backend.so*' | head -1)")
