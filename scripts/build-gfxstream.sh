@@ -46,13 +46,16 @@ fi
 # one GL enum still used) and make those checks constant without GLES.
 python3 - <<'PY'
 import os
-if not os.path.exists("host/gles_compat.h"):
+if True:
     open("host/gles_compat.h", "w").write("""\
 // Restored for Vulkan-only builds (removed upstream in f85b46742).
 #ifndef GLES_COMPAT_H
 #define GLES_COMPAT_H
 
 #include <cstdint>
+// GL enums the format tables use (constants and types only, no EGL)
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 typedef unsigned int GLenum;
 typedef int32_t EGLint;
