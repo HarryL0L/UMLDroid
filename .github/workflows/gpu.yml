@@ -34,7 +34,9 @@ jobs:
           pkg-config = 'false'
 
           [built-in options]
-          cpp_link_args = ['-static-libstdc++']
+          c_args = ['-DVK_USE_PLATFORM_ANDROID_KHR']
+          cpp_args = ['-DVK_USE_PLATFORM_ANDROID_KHR']
+          cpp_link_args = ['-static-libstdc++', '-lnativewindow', '-landroid', '-llog']
 
           [host_machine]
           system = 'android'
