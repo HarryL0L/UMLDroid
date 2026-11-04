@@ -40,6 +40,58 @@ ed("host/meson.build",
 PY
 fi
 
+# Vulkan-only builds (no GLES decoder) do not compile at the pinned commit:
+# host/gles_compat.h was deleted upstream (Aug 2026) and a few ColorBuffer
+# checks use the GL backing unguarded. Restore the header (as it was, plus
+# one GL enum still used) and make those checks constant without GLES.
+python3 - <<'PY'
+import os
+if not os.path.exists("host/gles_compat.h"):
+    open("host/gles_compat.h", "w").write("""\
+// Restored for Vulkan-only builds (removed upstream in f85b46742).
+#ifndef GLES_COMPAT_H
+#define GLES_COMPAT_H
+
+#include <cstdint>
+
+typedef unsigned int GLenum;
+typedef int32_t EGLint;
+typedef void* EGLNativeWindowType;
+
+#ifndef GL_BGR10_A2_ANGLEX
+#define GL_BGR10_A2_ANGLEX 0x6AF9
+#endif
+
+namespace gfxstream {
+namespace gl {
+class EmulationGl {
+   public:
+    EmulationGl() {}
+    ~EmulationGl() {}
+
+   private:
+    uint32_t payload;
+};
+}  // namespace gl
+}  // namespace gfxstream
+
+#endif
+""")
+p = "host/color_buffer.cpp"
+s = open(p).read()
+if "UMLDROID_GL_BACKING" not in s:
+    s = s.replace("!(mColorBufferGl && mColorBufferVk)", "!(UMLDROID_GL_BACKING && mColorBufferVk)")
+    i = s.index("namespace gfxstream")
+    s = s[:i] + """#if GFXSTREAM_ENABLE_HOST_GLES
+#define UMLDROID_GL_BACKING mColorBufferGl
+#else
+#define UMLDROID_GL_BACKING false
+#endif
+
+""" + s[i:]
+    open(p, "w").write(s)
+PY
+
 CROSS=()
 [ -n "${MESON_CROSS:-}" ] && CROSS=(--cross-file "$MESON_CROSS")
 [ -d build ] || meson setup build "${CROSS[@]}" -Ddefault_library=shared \
