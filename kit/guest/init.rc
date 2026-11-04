@@ -45,6 +45,18 @@ on property:sys.boot_completed=1 && property:ro.boot.uml_lite=1
 on property:sys.boot_completed=1 && property:ro.boot.uml_lite=0
     exec_background u:r:su:s0 root root -- /dev/uml/lite.sh off
 
+# androidboot.uml_logcat=1: Android's errors (and the graphics stack's
+# warnings) into the kernel log, so that the console log shows them
+service uml_logcat /system/bin/sh -c "exec /system/bin/logcat -v brief -b main,system,crash *:E hwcomposer:W ranchu:W HWC3:W SurfaceFlinger:W gralloc:W minigbm:W gfxstream:W vulkan:W libEGL:W > /dev/kmsg"
+    user root
+    group root log
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+
+on property:init.svc.logd=running && property:ro.boot.uml_logcat=1
+    start uml_logcat
+
 import /system/etc/init/hw/init.rc
 import /system/etc/init
 import /system_ext/etc/init

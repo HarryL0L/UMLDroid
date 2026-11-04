@@ -431,6 +431,8 @@ public class UmlService extends Service {
             }
             a.add("androidboot.hardware.hwcomposer.mode=client");
             a.add("androidboot.hardware.gltransport=virtio-gpu-asg");
+            // while GPU mode is experimental: Android's errors in the console log
+            a.add("androidboot.uml_logcat=1");
         }
         return a;
     }
