@@ -32,6 +32,12 @@ def ed(p, old, new):
         return
     assert old in s, (p, old)
     open(p, "w").write(s.replace(old, new, 1))
+# GL: Android is __linux__ but has no GLX; use the Android native window
+ed("host/gl/glestranslator/common/gl_dispatch.cpp", "#ifdef __linux__\n#include <GL/glx.h>",
+   "#if defined(__linux__) && !defined(__ANDROID__)\n#include <GL/glx.h>")
+ed("host/native_window/meson.build",
+   "elif host_machine.system() == 'linux' and use_gles\n",
+   "elif host_machine.system() == 'android'\n  files_lib_host_native_window += files('native_sub_window_android.cpp')\nelif host_machine.system() == 'linux' and use_gles\n")
 ed("meson.build", "elif host_machine.system() == 'linux'\n",
    "elif host_machine.system() in ['linux', 'android']\n")
 ed("host/meson.build",
@@ -98,7 +104,7 @@ PY
 CROSS=()
 [ -n "${MESON_CROSS:-}" ] && CROSS=(--cross-file "$MESON_CROSS")
 [ -d build ] || meson setup build "${CROSS[@]}" -Ddefault_library=shared \
-  -Dgfxstream-build=host -Ddecoders=${DECODERS:-vulkan,composer} -Dbuildtype=release \
+  -Dgfxstream-build=host -Ddecoders=${DECODERS:-auto} -Dbuildtype=release \
   -Dlog-level=warn "$@"
 ninja -C build
 find "$PWD/build" -name 'libgfxstream_backend.so*' | head -3
