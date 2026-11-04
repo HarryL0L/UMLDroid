@@ -194,8 +194,13 @@ static void gfx_present(struct resource *r)
 		h = scanout_blob.height;
 		fmt = scanout_blob.format;
 	}
-	if (!w || !h || w > 8192 || h > 8192)
+	static unsigned long presented, failed;
+
+	if (!w || !h || w > 8192 || h > 8192) {
+		if (failed++ < 10)
+			fprintf(stderr, "umlgpu: scanout %u has no size (%ux%u)\n", r->id, w, h);
 		return;
+	}
 	size_t need = (size_t)w * h * 4;
 	if (need > bufsize) {
 		free(buf);
@@ -207,8 +212,11 @@ static void gfx_present(struct resource *r)
 		void *hva;
 		uint64_t size;
 
-		if (stream_renderer_resource_map(r->id, &hva, &size))
+		if (stream_renderer_resource_map(r->id, &hva, &size)) {
+			if (failed++ < 10)
+				fprintf(stderr, "umlgpu: cannot map scanout blob %u\n", r->id);
 			return;
+		}
 		for (uint32_t y = 0; y < h; y++) {
 			uint64_t off = scanout_blob.offset + (uint64_t)y * scanout_blob.stride;
 
@@ -221,12 +229,18 @@ static void gfx_present(struct resource *r)
 		struct stream_renderer_box box = { 0, 0, 0, w, h, 1 };
 		struct iovec iov = { buf, need };
 
-		if (stream_renderer_transfer_read_iov(r->id, 0, 0, w * 4, 0, &box, 0, &iov, 1))
+		if (stream_renderer_transfer_read_iov(r->id, 0, 0, w * 4, 0, &box, 0, &iov, 1)) {
+			if (failed++ < 10)
+				fprintf(stderr, "umlgpu: cannot read back scanout %u (%ux%u fmt %u)\n",
+					r->id, w, h, fmt);
 			return;
+		}
 	}
 
 	struct resource view = { .id = r->id, .format = fmt, .width = w, .height = h, .data = buf };
 	present(&view);
+	if (++presented == 1 || presented % 600 == 0)
+		fprintf(stderr, "umlgpu: %lu frames shown (%ux%u fmt %u)\n", presented, w, h, fmt);
 }
 
 /* ---- commands ---- */
@@ -407,6 +421,9 @@ static int gfx_handle(VuDev *dev, const uint8_t *req, size_t len, uint8_t *resp,
 
 		if (s->scanout_id != 0)
 			OK(VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
+		static int n;
+		if (n++ < 5)
+			fprintf(stderr, "umlgpu: set scanout %u %ux%u\n", s->resource_id, s->r.width, s->r.height);
 		scanout_res = s->resource_id;
 		scanout_rect = s->r;
 		scanout_blob.blob = false;
@@ -417,6 +434,10 @@ static int gfx_handle(VuDev *dev, const uint8_t *req, size_t len, uint8_t *resp,
 
 		if (s->scanout_id != 0)
 			OK(VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
+		static int n;
+		if (n++ < 5)
+			fprintf(stderr, "umlgpu: set scanout blob %u %ux%u fmt %u stride %u\n", s->resource_id,
+				s->width, s->height, s->format, s->strides[0]);
 		scanout_res = s->resource_id;
 		scanout_rect = s->r;
 		scanout_blob.blob = s->resource_id != 0;
@@ -433,6 +454,12 @@ static int gfx_handle(VuDev *dev, const uint8_t *req, size_t len, uint8_t *resp,
 
 		if (r && f->resource_id == scanout_res)
 			gfx_present(r);
+		else {
+			static int n;
+			if (n++ < 5)
+				fprintf(stderr, "umlgpu: flush of %u, scanout is %u%s\n", f->resource_id,
+					scanout_res, r ? "" : " (unknown resource)");
+		}
 		OK(VIRTIO_GPU_RESP_OK_NODATA);
 	}
 	case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
@@ -495,6 +522,12 @@ static int gfx_handle(VuDev *dev, const uint8_t *req, size_t len, uint8_t *resp,
 		if (!r || mb->offset + r->blob_size > SHM_SIZE)
 			OK(VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
 		/* host memory as an FD the frontend can map: dma-buf, memfd, opaque fd */
+		{
+			static int n;
+			if (n++ < 3)
+				fprintf(stderr, "umlgpu: map blob %u (%llu bytes)\n", r->id,
+					(unsigned long long)r->blob_size);
+		}
 		if (stream_renderer_export_blob(r->id, &hd) || hd.os_handle < 0) {
 			fprintf(stderr, "umlgpu: blob %u cannot be exported\n", r->id);
 			OK(VIRTIO_GPU_RESP_ERR_UNSPEC);
