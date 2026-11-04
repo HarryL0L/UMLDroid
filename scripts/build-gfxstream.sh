@@ -43,6 +43,37 @@ ed("meson.build", "elif host_machine.system() == 'linux'\n",
 ed("host/meson.build",
    "if host_machine.system() == 'linux'\n  deps_gfxstream_backend += [\n    thread_dep,\n  ]\n  link_args_gfxstream_backend = ['-Wl,-lpthread,-lrt,-ldl']\n",
    "if host_machine.system() == 'android'\n  deps_gfxstream_backend += [\n    thread_dep,\n  ]\n  link_args_gfxstream_backend = ['-ldl']\nelif host_machine.system() == 'linux'\n  deps_gfxstream_backend += [\n    thread_dep,\n  ]\n  link_args_gfxstream_backend = ['-Wl,-lpthread,-lrt,-ldl']\n")
+# AndroidAHB mode (the only mode on Android hosts): ColorBuffers are
+# AHardwareBuffers, and images that share them are created for AHB handles,
+# but importExternalMemory() imported their memory as an opaque FD, which
+# drivers reject (VK_ERROR_INVALID_EXTERNAL_HANDLE). Import the AHB itself.
+ed("host/vulkan/vk_common_operations.cpp",
+   "    VkImportMemoryHostPointerInfoEXT importInfoHostPtr;\n",
+   "    VkImportMemoryHostPointerInfoEXT importInfoHostPtr;\n"
+   "#ifdef __ANDROID__\n"
+   "    VkImportAndroidHardwareBufferInfoANDROID importInfoAhb;\n"
+   "#endif\n")
+ed("host/vulkan/vk_common_operations.cpp",
+   "    switch (mDeviceInfo.externalMemoryMode) {\n"
+   "        case ExternalMemory::Mode::AndroidAHB:\n"
+   "        case ExternalMemory::Mode::OpaqueFd: {\n"
+   "            auto dupHandle = dupExternalMemory(handleInfo);",
+   "    switch (mDeviceInfo.externalMemoryMode) {\n"
+   "        case ExternalMemory::Mode::AndroidAHB:\n"
+   "#ifdef __ANDROID__\n"
+   "            if (handleInfo && handleInfo->streamHandleType == STREAM_HANDLE_TYPE_PLATFORM_AHB) {\n"
+   "                importInfoAhb = {\n"
+   "                    VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,\n"
+   "                    dedicatedAllocInfoPtr,\n"
+   "                    reinterpret_cast<AHardwareBuffer*>(static_cast<intptr_t>(handleInfo->handle)),\n"
+   "                };\n"
+   "                importInfoPtr = &importInfoAhb;\n"
+   "                break;\n"
+   "            }\n"
+   "            [[fallthrough]];\n"
+   "#endif\n"
+   "        case ExternalMemory::Mode::OpaqueFd: {\n"
+   "            auto dupHandle = dupExternalMemory(handleInfo);")
 PY
 fi
 
