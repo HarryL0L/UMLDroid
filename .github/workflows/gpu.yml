@@ -1,0 +1,79 @@
+name: GPU backend (gfxstream + umlgpu, Android arm64)
+
+on:
+  push:
+    paths:
+      - "kit/gpu/**"
+      - "scripts/build-gfxstream.sh"
+      - ".github/workflows/gpu.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      API: "30"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq meson ninja-build python3-mako
+          echo "NDK=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Meson cross file (Android arm64, NDK)
+        run: |
+          T=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          cat > android-arm64.ini <<EOF
+          [binaries]
+          c = '$T/aarch64-linux-android$API-clang'
+          cpp = '$T/aarch64-linux-android$API-clang++'
+          ar = '$T/llvm-ar'
+          strip = '$T/llvm-strip'
+          pkg-config = 'false'
+
+          [built-in options]
+          cpp_link_args = ['-static-libstdc++']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+          EOF
+          cat android-arm64.ini
+
+      - name: gfxstream
+        run: |
+          ANDROID_HOST=1 MESON_CROSS=$PWD/android-arm64.ini \
+            scripts/build-gfxstream.sh "$PWD/gfxstream-build" 2>&1 | tee gfxstream.log
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: umlgpu
+        run: |
+          T=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          G=$PWD/gfxstream-build/gfxstream
+          LIB=$(dirname "$(find $G/build -name 'libgfxstream_backend.so*' | head -1)")
+          mkdir -p out
+          cp -L $LIB/libgfxstream_backend.so out/
+          $T/aarch64-linux-android$API-clang -O2 -Wall -Wno-address-of-packed-member \
+            -D_GNU_SOURCE -DHAVE_GFXSTREAM -Ikit/gpu/src -I$G/host/include \
+            -o out/umlgpu kit/gpu/src/umlgpu.c kit/gpu/src/libvhost-user.c \
+            -Lout -lgfxstream_backend -Wl,-rpath,'$ORIGIN'
+          $T/llvm-strip out/umlgpu out/libgfxstream_backend.so
+          ls -la out
+          file out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: umlgpu-android-arm64
+          path: out/
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs
+          path: |
+            gfxstream.log
+            gfxstream-build/gfxstream/build/meson-logs/
