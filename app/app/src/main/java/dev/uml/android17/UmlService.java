@@ -133,7 +133,7 @@ public class UmlService extends Service {
     private Paths paths;
     private Thread worker;
     private final AtomicBoolean cancel = new AtomicBoolean();
-    private volatile Process kernel;
+    private volatile Process kernel, gpu;
     private volatile OutputStream consoleIn;
     private volatile boolean consoleReady, stopping;
     private PowerManager.WakeLock wakeLock;
@@ -175,6 +175,7 @@ public class UmlService extends Service {
         Process k = kernel;
         if (k != null)
             k.destroyForcibly();
+        stopGpu();
         releaseWakeLock();
         super.onDestroy();
     }
@@ -293,6 +294,7 @@ public class UmlService extends Service {
             if (!paths.fifo.exists())
                 Os.mkfifo(paths.fifo.getPath(), 0600);
             Touch.reset();
+            startGpu();
 
             ProcessBuilder pb = new ProcessBuilder(kernelArgs())
                     .directory(paths.dir)
@@ -312,6 +314,7 @@ public class UmlService extends Service {
             int code = k.waitFor();
             tail.join(2000);
             kernel = null;
+            stopGpu();
             if (stopping || code == 0)
                 set(Phase.IDLE, "Android stopped", 0, 0);
             else
@@ -319,8 +322,49 @@ public class UmlService extends Service {
                         + "). The console log shows why.", 0, 0);
         } catch (Throwable e) {
             kernel = null;
+            stopGpu();
             set(Phase.ERROR, "Could not start: " + e.getMessage(), 0, 0);
         }
+    }
+
+    /*
+     * GPU modes: umlgpu (a vhost-user virtio-gpu device, kit/gpu) runs next to
+     * the kernel, which connects to it at boot. It writes the frames into
+     * fb.bin like vkms does; in gfxstream mode Android's GPU drivers run on the
+     * phone's GPU through it.
+     */
+    private void startGpu() throws IOException, InterruptedException {
+        int mode = Paths.gpuMode(this);
+        if (mode == Paths.GPU_SOFTWARE)
+            return;
+        if (!new File(paths.umlgpu).exists())
+            throw new IOException("this build has no GPU backend (libumlgpu.so)");
+        int[] size = Paths.displaySize(this);
+        paths.gpuSock.delete();
+        ProcessBuilder pb = new ProcessBuilder(paths.umlgpu, "gpu.sock", paths.fb.getPath(),
+                Integer.toString(size[0]), Integer.toString(size[1]))
+                .directory(paths.dir)
+                .redirectErrorStream(true)
+                .redirectOutput(paths.gpuLog);
+        if (mode == Paths.GPU_GFXSTREAM)
+            pb.environment().put("UMLGPU_GFXSTREAM", "1");
+        gpu = pb.start();
+        for (int i = 0; i < 100 && !paths.gpuSock.exists(); i++) {
+            if (!gpu.isAlive())
+                break;
+            Thread.sleep(50);
+        }
+        if (!paths.gpuSock.exists()) {
+            stopGpu();
+            throw new IOException("the GPU backend did not start (see umlgpu.log)");
+        }
+    }
+
+    private void stopGpu() {
+        Process g = gpu;
+        gpu = null;
+        if (g != null)
+            g.destroyForcibly();
     }
 
     private List<String> kernelArgs() {
@@ -365,6 +409,29 @@ public class UmlService extends Service {
         };
         for (String s : fixed)
             a.add(s);
+        int gpuMode = Paths.gpuMode(this);
+        if (gpuMode != Paths.GPU_SOFTWARE) {
+            // the kernel's cwd is paths.dir: a short relative socket path
+            a.add("vkms.create_default_dev=0");
+            a.add("virtio_uml.device=gpu.sock:16");
+        }
+        if (gpuMode == Paths.GPU_GFXSTREAM) {
+            // Cuttlefish's gfxstream setup: ranchu composer and Vulkan, ANGLE for GLES
+            for (int i = 0; i < a.size(); i++) {
+                String s = a.get(i);
+                if (s.startsWith("androidboot.hardware.hwcomposer="))
+                    a.set(i, "androidboot.hardware.hwcomposer=ranchu");
+                else if (s.startsWith("androidboot.hardware.vulkan="))
+                    a.set(i, "androidboot.hardware.vulkan=ranchu");
+                else if (s.startsWith("androidboot.cpuvulkan.version="))
+                    a.set(i, "androidboot.cpuvulkan.version=0");
+                else if (s.startsWith("androidboot.vendor.apex.com.android.hardware.graphics.composer="))
+                    a.set(i, "androidboot.vendor.apex.com.android.hardware.graphics.composer="
+                            + "com.android.hardware.graphics.composer.ranchu");
+            }
+            a.add("androidboot.hardware.hwcomposer.mode=client");
+            a.add("androidboot.hardware.gltransport=virtio-gpu-asg");
+        }
         return a;
     }
 
@@ -383,7 +450,8 @@ public class UmlService extends Service {
                 if (len <= 0)
                     continue;
                 String cmd = new String(b, 0, len, StandardCharsets.UTF_8);
-                if (cmd.startsWith(paths.kernel + "\0") && Integer.parseInt(n) != android.os.Process.myPid())
+                if ((cmd.startsWith(paths.kernel + "\0") || cmd.startsWith(paths.umlgpu + "\0"))
+                        && Integer.parseInt(n) != android.os.Process.myPid())
                     android.os.Process.sendSignal(Integer.parseInt(n), 9);
             } catch (IOException | RuntimeException ignored) {
             }

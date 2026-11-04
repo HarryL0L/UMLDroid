@@ -8,6 +8,11 @@
     <string name="stubthreads_note">Lets the threads of an app run at the same time. Warm launches got faster in tests, cold launches slower.</string>
     <string name="wakelock">Keep running while the screen is off</string>
     <string name="console">Console</string>
+    <string name="graphics">Graphics</string>
+    <string name="gpu_software">Software</string>
+    <string name="gpu_display">Virtual GPU</string>
+    <string name="gpu_gfxstream">GPU (beta)</string>
+    <string name="graphics_note">Software: Android draws on the CPU (tested). Virtual GPU: the same, shown through a virtio-gpu device (tests the GPU path). GPU (beta): Android\'s Vulkan and OpenGL run on this phone\'s GPU through gfxstream; experimental, may not boot yet.</string>
     <string name="lite">Daily-use trim</string>
     <string name="lite_note">Turns off system apps that have nothing to do here (Bluetooth, NFC, telephony extras, printing, …) and compiles the always-running apps ahead of time, once, in the background after the first boot with it on. Faster boots, less background work. Turning it off brings them back.</string>
     <string name="fill">Fill the whole screen (about 25% more drawing)</string>

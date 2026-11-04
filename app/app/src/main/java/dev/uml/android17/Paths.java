@@ -9,7 +9,8 @@ import java.io.File;
 /** Where everything lives (app-private storage) and the user's settings. */
 final class Paths {
     final File dir, disk, initrd, console, fb, fifo, zip, unpack, vendorRamdisk, initRamdisk, home, tmp;
-    final String kernel;
+    final String kernel, umlgpu;
+    final File gpuSock, gpuLog;
 
     Paths(Context c) {
         dir = new File(c.getFilesDir(), "android");
@@ -25,6 +26,9 @@ final class Paths {
         home = c.getFilesDir();
         tmp = new File(c.getCacheDir(), "uml-tmp");
         kernel = c.getApplicationInfo().nativeLibraryDir + "/libuml.so";
+        umlgpu = c.getApplicationInfo().nativeLibraryDir + "/libumlgpu.so";
+        gpuSock = new File(dir, "gpu.sock");
+        gpuLog = new File(dir, "umlgpu.log");
     }
 
     boolean installed() {
@@ -47,6 +51,13 @@ final class Paths {
 
     static boolean lite(Context c) {
         return prefs(c).getBoolean("lite", true);
+    }
+
+    /** 0: software (vkms), 1: virtio-gpu display only, 2: GPU acceleration (gfxstream) */
+    static final int GPU_SOFTWARE = 0, GPU_DISPLAY = 1, GPU_GFXSTREAM = 2;
+
+    static int gpuMode(Context c) {
+        return prefs(c).getInt("gpu", GPU_SOFTWARE);
     }
 
     static boolean extraNav(Context c) {

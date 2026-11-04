@@ -9,8 +9,8 @@ android {
         // 28, as Termux: see AndroidManifest.xml
         //noinspection ExpiredTargetSdkVersion
         targetSdk 28
-        versionCode 3
-        versionName "0.3"
+        versionCode 4
+        versionName "0.4"
         ndk { abiFilters "arm64-v8a" }
     }
     buildTypes {
@@ -46,5 +46,12 @@ tasks.register("syncKitKernel", Copy) {
     rename { "libuml.so" }
     into "src/main/jniLibs/arm64-v8a"
 }
-preBuild.dependsOn("syncKitGuest", "syncKitKernel")
+// GPU backend from CI (.github/workflows/gpu.yml): umlgpu as libumlgpu.so
+// (an executable, like the kernel) and gfxstream; optional
+tasks.register("syncKitGpu", Copy) {
+    from("${kit}/bin/android") { include "umlgpu", "libgfxstream_backend.so" }
+    rename { it == "umlgpu" ? "libumlgpu.so" : it }
+    into "src/main/jniLibs/arm64-v8a"
+}
+preBuild.dependsOn("syncKitGuest", "syncKitKernel", "syncKitGpu")
 

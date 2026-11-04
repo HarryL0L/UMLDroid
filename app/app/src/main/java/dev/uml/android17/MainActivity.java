@@ -127,6 +127,16 @@ public class MainActivity extends AppCompatActivity {
         MaterialSwitch wake = findViewById(R.id.wakelock);
         MaterialSwitch stubs = findViewById(R.id.stubthreads);
         MaterialSwitch lite = findViewById(R.id.lite);
+        com.google.android.material.button.MaterialButtonToggleGroup gpu = findViewById(R.id.gpuMode);
+        int[] gpuIds = {R.id.gpuSoftware, R.id.gpuDisplay, R.id.gpuGfxstream};
+        gpu.check(gpuIds[Math.max(0, Math.min(2, Paths.gpuMode(this)))]);
+        gpu.addOnButtonCheckedListener((g, id, checked) -> {
+            if (!checked)
+                return;
+            for (int i = 0; i < gpuIds.length; i++)
+                if (gpuIds[i] == id)
+                    Paths.prefs(this).edit().putInt("gpu", i).apply();
+        });
         MaterialSwitch fill = findViewById(R.id.fill);
         MaterialSwitch extraNav = findViewById(R.id.extranav);
         lite.setChecked(Paths.lite(this));
@@ -423,8 +433,10 @@ public class MainActivity extends AppCompatActivity {
             requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1);
             return;
         }
-        File out = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "android17-uml-console.log");
+        File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        File out = new File(dl, "android17-uml-console.log");
+        if (paths.gpuLog.exists())
+            copyFile(paths.gpuLog, new File(dl, "android17-uml-umlgpu.log"));
         try (InputStream in = new FileInputStream(paths.console);
              OutputStream o = new FileOutputStream(out)) {
             byte[] buf = new byte[1 << 16];
@@ -434,6 +446,16 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Saved to Downloads/" + out.getName(), Toast.LENGTH_LONG).show();
         } catch (IOException e) {
             Toast.makeText(this, "Could not save the log: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private static void copyFile(File from, File to) {
+        try (InputStream in = new FileInputStream(from); OutputStream o = new FileOutputStream(to)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0)
+                o.write(buf, 0, n);
+        } catch (IOException ignored) {
         }
     }
 
