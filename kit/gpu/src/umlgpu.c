@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -637,6 +638,74 @@ static void panic_cb(VuDev *dev, const char *msg)
 	exit(1);
 }
 
+/*
+ * A crash in gfxstream or the GPU driver otherwise leaves no trace (the app
+ * cannot read Android's tombstones): print the signal, fault address and a
+ * symbolized backtrace to stderr, i.e. umlgpu.log.
+ */
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <unwind.h>
+
+static void crash_line(const char *what, uintptr_t pc)
+{
+	Dl_info di;
+	char b[512];
+	int n;
+
+	if (dladdr((void *)pc, &di) && di.dli_fname)
+		n = snprintf(b, sizeof(b), "umlgpu:   %s %#lx %s+%#lx %s\n", what, (unsigned long)pc,
+			     strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname,
+			     (unsigned long)(pc - (uintptr_t)di.dli_fbase),
+			     di.dli_sname ? di.dli_sname : "");
+	else
+		n = snprintf(b, sizeof(b), "umlgpu:   %s %#lx\n", what, (unsigned long)pc);
+	if (n > 0)
+		write(2, b, n < (int)sizeof(b) ? n : (int)sizeof(b) - 1);
+}
+
+static _Unwind_Reason_Code crash_frame(struct _Unwind_Context *c, void *arg)
+{
+	int *depth = arg;
+	uintptr_t pc = _Unwind_GetIP(c);
+
+	if (pc)
+		crash_line("at", pc);
+	return ++*depth < 40 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *uc)
+{
+	char b[160];
+	int depth = 0, n;
+
+	n = snprintf(b, sizeof(b), "umlgpu: crashed: signal %d (%s), code %d, address %p\n", sig,
+		     strsignal(sig), si->si_code, si->si_addr);
+	write(2, b, n);
+#if defined(__aarch64__)
+	crash_line("pc", ((ucontext_t *)uc)->uc_mcontext.pc);
+	crash_line("lr", ((ucontext_t *)uc)->uc_mcontext.regs[30]);
+#elif defined(__x86_64__)
+	crash_line("pc", ((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP]);
+#endif
+	_Unwind_Backtrace(crash_frame, &depth);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void crash_setup(void)
+{
+	static char altstack[64 * 1024];
+	stack_t ss = { .ss_sp = altstack, .ss_size = sizeof(altstack) };
+	struct sigaction sa = { .sa_sigaction = crash_handler, .sa_flags = SA_SIGINFO | SA_ONSTACK };
+	const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+
+	sigaltstack(&ss, NULL);
+	sigemptyset(&sa.sa_mask);
+	for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+		sigaction(sigs[i], &sa, NULL);
+}
+
 int main(int argc, char **argv)
 {
 	struct sockaddr_un sa = { .sun_family = AF_UNIX };
@@ -656,6 +725,7 @@ int main(int argc, char **argv)
 	disp_w = atoi(argv[3]);
 	disp_h = atoi(argv[4]);
 	signal(SIGPIPE, SIG_IGN);
+	crash_setup();
 
 	fd = open(argv[2], O_RDWR | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0 || ftruncate(fd, UMFB_SIZE) < 0) {
