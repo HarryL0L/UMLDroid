@@ -429,7 +429,7 @@ public class UmlService extends Service {
                     a.set(i, "androidboot.vendor.apex.com.android.hardware.graphics.composer="
                             + "com.android.hardware.graphics.composer.ranchu");
             }
-            a.add("androidboot.hardware.hwcomposer.mode=client");
+            // as Cuttlefish's gfxstream_guest_angle: the host composer, no hwcomposer.mode
             a.add("androidboot.hardware.gltransport=virtio-gpu-asg");
             // while GPU mode is experimental: Android's errors in the console log
             a.add("androidboot.uml_logcat=1");

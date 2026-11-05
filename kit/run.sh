@@ -85,8 +85,8 @@ case "$GPU" in
             BOOT[$i]=androidboot.vendor.apex.com.android.hardware.graphics.composer=com.android.hardware.graphics.composer.ranchu ;;
         esac
       done
-      BOOT+=(androidboot.hardware.hwcomposer.mode=client androidboot.hardware.gltransport=virtio-gpu-asg
-             androidboot.uml_logcat=1)
+      # as Cuttlefish's gfxstream_guest_angle: the host composer (no hwcomposer.mode)
+      BOOT+=(androidboot.hardware.gltransport=virtio-gpu-asg androidboot.uml_logcat=1)
     fi ;;
   *) echo "run: --gpu takes 2d or gfxstream" >&2; exit 1 ;;
 esac
