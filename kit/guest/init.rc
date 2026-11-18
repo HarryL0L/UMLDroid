@@ -57,6 +57,11 @@ service uml_logcat /system/bin/sh -c "exec /system/bin/logcat -v brief -b main,s
 on property:init.svc.logd=running && property:ro.boot.uml_logcat=1
     start uml_logcat
 
+# androidboot.uml_tz=<zone>: the phone's time zone (persist.sys.timezone is
+# loaded from /data first, so set it once persistent properties are ready)
+on property:ro.persistent_properties.ready=true && property:ro.boot.uml_tz=*
+    setprop persist.sys.timezone ${ro.boot.uml_tz}
+
 import /system/etc/init/hw/init.rc
 import /system/etc/init
 import /system_ext/etc/init

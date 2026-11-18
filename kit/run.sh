@@ -47,6 +47,9 @@ case "$(uname -m)" in
 esac
 [ -f "$A/disk.img" ] && [ -f "$A/initrd.img" ] || { echo "run: run ./setup.sh first" >&2; exit 1; }
 
+# the phone's time zone (Termux: Android's persist.sys.timezone)
+TZONE=${TZONE:-$(getprop persist.sys.timezone 2>/dev/null)}
+TZONE=${TZONE:-UTC}
 BOOT=(
   androidboot.hardware=cutf_cvm androidboot.slot_suffix=_a androidboot.fstab_suffix=cf.f2fs.hctr2
   androidboot.boot_devices=virtual/block/ubda androidboot.verifiedbootstate=orange
@@ -66,6 +69,7 @@ BOOT=(
   androidboot.vsock_lights_port=6900 androidboot.vsock_lights_cid=3
   androidboot.hypervisor.vm.supported=0 androidboot.hypervisor.protected_vm.supported=0
   androidboot.guest_soc.model=UML androidboot.uml_lite=$LITE
+  androidboot.uml_tz=$TZONE
 )
 # --gpu: a virtio-gpu device served by umlgpu (see gpu/README.md) instead of
 # vkms. 2d: display only (Android still draws with SwiftShader). gfxstream:

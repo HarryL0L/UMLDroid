@@ -406,6 +406,7 @@ public class UmlService extends Service {
                 "androidboot.hypervisor.vm.supported=0", "androidboot.hypervisor.protected_vm.supported=0",
                 "androidboot.guest_soc.model=UML",
                 "androidboot.uml_lite=" + (Paths.lite(this) ? 1 : 0),
+                "androidboot.uml_tz=" + java.util.TimeZone.getDefault().getID(),
         };
         for (String s : fixed)
             a.add(s);
